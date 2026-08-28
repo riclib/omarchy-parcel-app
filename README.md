@@ -12,8 +12,11 @@ This plugin doesn't replace it — it reads the deliveries you've already added
 there through Parcel's Premium API, so your desktop and your phone agree.
 
 > **Requires** Omarchy Quattro (`omarchy-shell`) and a [Parcel Premium](https://parcelapp.net/help/premium.html)
-> subscription — the API is a Premium feature. Everything else (`curl`, `jq`,
-> `secret-tool`, `wl-copy`) ships with Omarchy.
+> subscription — the API is a Premium feature. External dependencies are all
+> part of a stock Omarchy install: `curl`, `jq`, `secret-tool` (libsecret),
+> `wl-copy` (wl-clipboard) and `flock` (util-linux). No sudo, no packages to
+> install, no changes to your configuration beyond the plugin's own entry in
+> `shell.json` that `omarchy plugin enable` writes.
 
 ## Install
 
@@ -64,6 +67,22 @@ Bind a key in `~/.config/hypr/bindings.lua`:
 ```lua
 o.bind("SUPER + CTRL + SHIFT + P", "Parcel", "omarchy-shell shell toggle io.github.zuccs.parcel")
 ```
+
+## Uninstall
+
+```bash
+omarchy plugin remove io.github.zuccs.parcel
+```
+
+That removes the plugin directory and its `shell.json` entry. Two things are
+yours and are left alone; clear them if you want a clean slate:
+
+```bash
+secret-tool clear service omarchy-parcel key api-key   # the API key in your keyring
+rm -rf ~/.local/state/omarchy/parcel                    # cached deliveries
+```
+
+If you added a keybind in `~/.config/hypr/bindings.lua`, delete that line too.
 
 ## Settings
 
