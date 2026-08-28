@@ -12,15 +12,15 @@ function response(deliveries, extra) {
 const carriers = { au: "Australia Post", fedex: "FedEx", fastau: "Fastway (Aramex)" }
 
 const SAMPLE = [
-  { carrier_code: "au", description: "Coffee machine", status_code: 3, tracking_number: "AAA111",
+  { carrier_code: "au", description: "Garden hose", status_code: 3, tracking_number: "AAA111",
     events: [
       { event: "In transit", date: "27.08.2026 07:41", location: "RICHMOND VIC" },
       { event: "Awaiting collection at RICHMOND PO", date: "27.08.2026 07:47", location: "RICHMOND VIC" }
     ] },
-  { carrier_code: "fastau", description: "Server rack", status_code: 4, tracking_number: "BBB222", date_expected: "2026-08-28 00:00:00", events: [] },
-  { carrier_code: "fedex", description: "Sunglasses", status_code: 2, tracking_number: "CCC333",
+  { carrier_code: "fastau", description: "Board game", status_code: 4, tracking_number: "BBB222", date_expected: "2026-08-28 00:00:00", events: [] },
+  { carrier_code: "fedex", description: "Headphones", status_code: 2, tracking_number: "CCC333",
     date_expected: "2026-08-28 10:00:00", date_expected_end: "2026-08-28 14:00:00", events: [{ event: "Departed", date: "26.08.2026 22:10" }] },
-  { carrier_code: "dhl", description: "Old thing", status_code: 0, tracking_number: "DDD444", events: [] }
+  { carrier_code: "dhl", description: "Library book", status_code: 0, tracking_number: "DDD444", events: [] }
 ]
 
 test("parseDate handles both Parcel formats and rejects junk", () => {
@@ -47,7 +47,7 @@ test("parseResponse normalises, sorts by urgency, and never throws", () => {
   const r = Model.parseResponse(response(SAMPLE), carriers)
   assert.equal(r.ok, true)
   assert.equal(r.deliveries.length, 4)
-  assert.deepEqual(r.deliveries.map(d => d.description), ["Server rack", "Coffee machine", "Sunglasses", "Old thing"])
+  assert.deepEqual(r.deliveries.map(d => d.description), ["Board game", "Garden hose", "Headphones", "Library book"])
   const rack = r.deliveries[0]
   assert.equal(rack.status, "Out for delivery"); assert.equal(rack.tone, "urgent"); assert.equal(rack.carrierName, "Fastway (Aramex)")
   const coffee = r.deliveries[1]
@@ -72,7 +72,7 @@ test("badge, lead and summary", () => {
   assert.equal(Model.activeDeliveries(list).length, 3)
   assert.equal(Model.badgeText(list), Model.BAR_GLYPH + " 3")
   assert.equal(Model.badgeUrgent(list), true)
-  assert.equal(Model.leadDelivery(list).description, "Server rack")
+  assert.equal(Model.leadDelivery(list).description, "Board game")
   assert.equal(Model.summaryLine(list), "3 deliveries · 1 out for delivery")
   assert.equal(Model.summaryLine(list.slice(2, 3)), "1 delivery · in transit")
   assert.equal(Model.badgeText([]), Model.BAR_GLYPH)
@@ -83,9 +83,9 @@ test("badge, lead and summary", () => {
 test("formatEta", () => {
   const list = Model.parseResponse(response(SAMPLE), carriers).deliveries
   const byName = Object.fromEntries(list.map(d => [d.description, d]))
-  assert.equal(Model.formatEta(byName["Server rack"], NOW), "Today")
-  assert.equal(Model.formatEta(byName["Sunglasses"], NOW), "Today 10:00–14:00")
-  assert.equal(Model.formatEta(byName["Coffee machine"], NOW), "")
+  assert.equal(Model.formatEta(byName["Board game"], NOW), "Today")
+  assert.equal(Model.formatEta(byName["Headphones"], NOW), "Today 10:00–14:00")
+  assert.equal(Model.formatEta(byName["Garden hose"], NOW), "")
   const tomorrow = Model.normalizeDelivery({ status_code: 2, date_expected: "2026-08-29 00:00:00" }, {})
   assert.equal(Model.formatEta(tomorrow, NOW), "Tomorrow")
   const later = Model.normalizeDelivery({ status_code: 2, date_expected: "2026-09-02 00:00:00" }, {})
@@ -113,24 +113,24 @@ test("formatRelative and formatEventTime", () => {
 test("diffStatuses reports transitions and disappearances, ignores first sightings", () => {
   const before = Model.parseResponse(response(SAMPLE), carriers).deliveries
   const afterRaw = [
-    Object.assign({}, SAMPLE[0], { status_code: 0 }),                 // coffee: pickup → delivered
-    Object.assign({}, SAMPLE[2], { status_code: 4 }),                 // sunglasses: transit → out for delivery
+    Object.assign({}, SAMPLE[0], { status_code: 0 }),                 // hose: pickup → delivered
+    Object.assign({}, SAMPLE[2], { status_code: 4 }),                 // headphones: transit → out for delivery
     { carrier_code: "ups", description: "Brand new", status_code: 2, tracking_number: "NEW1", events: [] }
-    // server rack vanished from the active list → treated as delivered
-    // old thing (already delivered) vanished → not reported
+    // board game vanished from the active list → treated as delivered
+    // library book (already delivered) vanished → not reported
   ]
   const after = Model.parseResponse(response(afterRaw), carriers).deliveries
   const changes = Model.diffStatuses(before, after)
   const byDesc = Object.fromEntries(changes.map(c => [c.description, c]))
-  assert.deepEqual(Object.keys(byDesc).sort(), ["Coffee machine", "Server rack", "Sunglasses"])
-  assert.equal(byDesc["Sunglasses"].to, "Out for delivery")
-  assert.equal(byDesc["Coffee machine"].to, "Delivered")
-  assert.equal(byDesc["Server rack"].to, Model.NO_LONGER_ACTIVE, "disappearance is not inferred as delivered")
-  assert.equal(byDesc["Server rack"].removed, true)
-  assert.match(Model.notificationFor(byDesc["Server rack"]).body, /delivered or removed/)
-  const n = Model.notificationFor(byDesc["Sunglasses"])
-  assert.equal(n.headline, "Sunglasses"); assert.equal(n.urgency, "normal"); assert.match(n.body, /^Out for delivery/)
-  assert.equal(Model.notificationFor(byDesc["Coffee machine"]).urgency, "low")
+  assert.deepEqual(Object.keys(byDesc).sort(), ["Garden hose", "Board game", "Headphones"])
+  assert.equal(byDesc["Headphones"].to, "Out for delivery")
+  assert.equal(byDesc["Garden hose"].to, "Delivered")
+  assert.equal(byDesc["Board game"].to, Model.NO_LONGER_ACTIVE, "disappearance is not inferred as delivered")
+  assert.equal(byDesc["Board game"].removed, true)
+  assert.match(Model.notificationFor(byDesc["Board game"]).body, /delivered or removed/)
+  const n = Model.notificationFor(byDesc["Headphones"])
+  assert.equal(n.headline, "Headphones"); assert.equal(n.urgency, "normal"); assert.match(n.body, /^Out for delivery/)
+  assert.equal(Model.notificationFor(byDesc["Garden hose"]).urgency, "low")
   assert.deepEqual(Model.diffStatuses([], after), [], "first fetch never notifies")
 })
 
