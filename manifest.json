@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.zuccs.parcel",
   "name": "Parcel",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Daniel Zuccon",
   "license": "MIT",
   "description": "Your Parcel app deliveries in the Omarchy bar: a status-tinted badge, active shipments with ETAs, event timelines, and desktop notifications when a parcel moves.",

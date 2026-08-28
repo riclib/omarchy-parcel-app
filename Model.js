@@ -28,7 +28,41 @@ function statusFor(code) {
   return STATUS.hasOwnProperty(n) ? STATUS[n] : UNKNOWN_STATUS
 }
 
-function trim(s) { return String(s === undefined || s === null ? "" : s).replace(/^\s+|\s+$/g, "") }
+// Everything below this line that touches `raw` is treating Parcel's response
+// as untrusted input: it is relayed from carrier systems, and it lands in QML
+// Text items, tooltips and notification arguments.
+//
+// MAX_TEXT is a display bound, not a security boundary on its own — the bridge
+// already caps the bytes that reach us — but it keeps one hostile field from
+// turning into a megabyte of text layout, and it stops a wall of text pushing
+// the rest of a row off screen.
+var MAX_TEXT = 200
+var MAX_CODE = 32
+var MAX_TRACKING = 64
+var MAX_DELIVERIES = 100
+var MAX_EVENTS = 50
+
+var CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g
+var LINE_BREAKS = /[\r\n\t\u2028\u2029]+/g
+
+// One-line, plain, bounded. Angle brackets become their single-angle-quote
+// cousins ‹ › — same look, but nothing can parse them as a tag. That matters
+// because these strings reach Qt components we do not own (the bar tooltip, a
+// notification body) where the text format is theirs to choose, and Qt's
+// AutoText treats anything tag-shaped as rich text — which will fetch an
+// <img src>. Text items in Panel.qml are pinned to Text.PlainText as well;
+// this is the half of that pair that survives leaving our own QML.
+function trim(s, limit) {
+  var out = String(s === undefined || s === null ? "" : s)
+    .replace(CONTROL_CHARS, "")
+    .replace(LINE_BREAKS, " ")
+    .replace(/</g, "\u2039")
+    .replace(/>/g, "\u203A")
+    .replace(/^\s+|\s+$/g, "")
+  var max = limit || MAX_TEXT
+  if (out.length > max) out = out.slice(0, max - 1) + "\u2026"
+  return out
+}
 
 // "27.08.2026 07:47" (events) or "2026-08-28 10:00:00" (expected) → Date|null.
 // Parcel reports times in the account's local zone without an offset; we treat
@@ -72,7 +106,10 @@ function parseCarriers(raw) {
     for (var code in data) {
       var entry = data[code]
       var name = entry && typeof entry === "object" ? entry.name : entry
-      if (typeof name === "string" && name) out[code] = name
+      if (typeof name === "string" && name) {
+        var clean = trim(name)
+        if (clean) out[trim(code, MAX_CODE)] = clean
+      }
     }
     return out
   } catch (e) {
@@ -81,9 +118,11 @@ function parseCarriers(raw) {
 }
 
 function carrierName(code, carriers) {
-  var c = trim(code)
+  var c = trim(code, MAX_CODE)
   if (!c) return ""
-  if (carriers && carriers[c]) return carriers[c]
+  // parseCarriers already cleans the map it builds; clean again on the way out
+  // so a map handed in from anywhere else cannot smuggle markup through.
+  if (carriers && carriers[c]) return trim(carriers[c])
   return c.toUpperCase()
 }
 
@@ -104,7 +143,8 @@ function normalizeDelivery(raw, carriers) {
   var status = statusFor(raw.status_code)
   var events = []
   if (Array.isArray(raw.events)) {
-    for (var i = 0; i < raw.events.length; i++) {
+    var eventCount = Math.min(raw.events.length, MAX_EVENTS)
+    for (var i = 0; i < eventCount; i++) {
       var ev = normalizeEvent(raw.events[i])
       if (ev && (ev.event || ev.location)) events.push(ev)
     }
@@ -120,8 +160,8 @@ function normalizeDelivery(raw, carriers) {
   var expectedEnd = typeof raw.timestamp_expected_end === "number" && raw.timestamp_expected_end > 0
     ? new Date(raw.timestamp_expected_end * 1000) : parseDate(raw.date_expected_end)
 
-  var carrierCode = trim(raw.carrier_code)
-  var tracking = trim(raw.tracking_number)
+  var carrierCode = trim(raw.carrier_code, MAX_CODE)
+  var tracking = trim(raw.tracking_number, MAX_TRACKING)
   return {
     key: carrierCode + ":" + tracking,
     description: trim(raw.description) || tracking || "Untitled delivery",
@@ -172,15 +212,16 @@ function parseResponse(raw, carriers) {
     result.message = "Empty response from parcel-api."
     return result
   }
-  result.error = trim(data.error)
-  result.message = trim(data.message)
+  result.error = trim(data.error, 40)
+  result.message = trim(data.message, 300)
   result.stale = data.stale === true
   result.cached = data.cached === true
   result.mode = trim(data.mode)
   result.fetchedAt = typeof data.fetchedAt === "number" ? data.fetchedAt * 1000 : 0
   if (Array.isArray(data.deliveries)) {
     var list = []
-    for (var i = 0; i < data.deliveries.length; i++) {
+    var count = Math.min(data.deliveries.length, MAX_DELIVERIES)
+    for (var i = 0; i < count; i++) {
       var d = normalizeDelivery(data.deliveries[i], carriers)
       if (d) list.push(d)
     }
@@ -321,6 +362,10 @@ var SETUP_COMMAND = "secret-tool store --label='Parcel API key' service omarchy-
 if (typeof module !== "undefined") {
   module.exports = {
     STATUS: STATUS,
+    MAX_TEXT: MAX_TEXT,
+    MAX_DELIVERIES: MAX_DELIVERIES,
+    MAX_EVENTS: MAX_EVENTS,
+    trim: trim,
     BAR_GLYPH: BAR_GLYPH,
     SETUP_COMMAND: SETUP_COMMAND,
     NO_LONGER_ACTIVE: NO_LONGER_ACTIVE,

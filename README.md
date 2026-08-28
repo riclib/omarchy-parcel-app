@@ -128,7 +128,21 @@ like every Omarchy bar widget. The defaults:
   `shell.json`, the QML never reads it, and `bin/parcel-api` hands it to `curl`
   as a config on stdin (`-K -`) rather than as an argument, so it doesn't show
   up in the process list either.
-- `bin/parcel-api` is ~200 lines of bash. Read it before you enable the plugin,
+- Everything the API returns is treated as untrusted — it is relayed from
+  carrier systems, not written by Parcel. Response bodies are capped at 1 MiB
+  before anything parses them, delivery and event lists are capped before they
+  reach the panel, and every remote string is flattened to one bounded line of
+  plain text. Every `Text` in the panel is pinned to `Text.PlainText`, so no
+  delivery description can turn into rich text and pull in a remote image.
+- The state directory sits at a predictable path, so the bridge treats it as
+  hostile: it refuses to use it if `omarchy/` or `parcel/` is a symlink, takes
+  its cross-monitor lock on the directory itself (there is no lock file to
+  plant), writes caches only via `rename(2)`, and reads them with a size cap
+  and a timeout so a swapped-in FIFO or oversized file can't wedge the shell.
+  A same-user process that races a cache swap between check and read can still
+  make the bridge read a file — bounded, and a file that process could already
+  read itself.
+- `bin/parcel-api` is ~425 lines of bash. Read it before you enable the plugin,
   as with any Omarchy plugin.
 
 ## Development

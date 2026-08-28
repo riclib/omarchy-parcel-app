@@ -140,3 +140,53 @@ test("unknown status codes degrade gracefully", () => {
   assert.equal(Model.normalizeDelivery(null, {}), null)
   assert.equal(Model.normalizeDelivery({ tracking_number: "X1" }, {}).description, "X1")
 })
+
+// ---- Hostile input -----------------------------------------------------------
+// Everything Parcel returns is relayed from carrier systems. These cover the
+// half of that defence that lives here; the other half is textFormat:
+// Text.PlainText on every Text in Panel.qml and the byte caps in bin/parcel-api.
+
+test("markup in remote strings never survives into the view model", () => {
+  const evil = '<img src="http://tracker.example/pixel.png">Parcel &amp; co'
+  const r = Model.parseResponse(response([
+    { carrier_code: "au", description: evil, status_code: 2, tracking_number: "E1",
+      events: [{ event: "<b>Out</b> for delivery", location: "<i>Depot</i>", date: "27.08.2026 07:41" }] }
+  ]), { au: "<script>x</script>Australia Post" })
+  const d = r.deliveries[0]
+  for (const s of [d.description, d.carrierName, d.events[0].event, d.events[0].location]) {
+    assert.ok(!/[<>]/.test(s), "angle brackets survived: " + s)
+  }
+  // Legible, but nothing left that a markup parser recognises as a tag.
+  assert.equal(d.description, '‹img src="http://tracker.example/pixel.png"›Parcel &amp; co')
+  assert.equal(d.carrierName, "‹script›x‹/script›Australia Post")
+})
+
+test("remote strings are one line and bounded", () => {
+  const r = Model.parseResponse(response([
+    { carrier_code: "au", description: "A".repeat(5000), status_code: 2, tracking_number: "B".repeat(500),
+      events: [{ event: "line one\nline two\r\nline three", date: "27.08.2026 07:41" }] }
+  ]), {})
+  const d = r.deliveries[0]
+  assert.equal(d.description.length, Model.MAX_TEXT)
+  assert.ok(d.description.endsWith("…"))
+  assert.ok(d.trackingNumber.length <= 64)
+  assert.equal(d.events[0].event, "line one line two line three")
+  assert.ok(!/[\r\n]/.test(d.events[0].event))
+})
+
+test("list lengths are capped so one response cannot flood the panel", () => {
+  const many = Array.from({ length: 5000 }, (_, i) => ({
+    carrier_code: "au", description: "P" + i, status_code: 2, tracking_number: "T" + i,
+    events: Array.from({ length: 500 }, (_, j) => ({ event: "E" + j, date: "27.08.2026 07:41" }))
+  }))
+  const r = Model.parseResponse(response(many), {})
+  assert.equal(r.deliveries.length, Model.MAX_DELIVERIES)
+  assert.ok(r.deliveries.every(d => d.events.length <= Model.MAX_EVENTS))
+})
+
+test("control characters go, ordinary text is left alone", () => {
+  assert.equal(Model.trim("Ben & Jerry's order"), "Ben & Jerry's order")
+  assert.equal(Model.trim("M&S; Courier  Ltd"), "M&S; Courier  Ltd", "entity-shaped text and spacing are left alone")
+  assert.equal(Model.trim("Café — 3 items"), "Café — 3 items")
+  assert.equal(Model.trim("bell\u0007 and null\u0000 "), "bell and null")
+})

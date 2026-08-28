@@ -336,6 +336,7 @@ Panel {
             spacing: Style.space(12)
 
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               text: Model.BAR_GLYPH
               color: root.badgeUrgent ? root.urgent : root.foreground
@@ -349,6 +350,7 @@ Panel {
               spacing: Style.space(2)
 
               Text {
+                textFormat: Text.PlainText
                 text: "PARCEL"
                 color: root.dim
                 font.family: root.fontFamily
@@ -356,6 +358,7 @@ Panel {
                 font.letterSpacing: 1
               }
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.headline
                 color: root.foreground
@@ -398,6 +401,7 @@ Panel {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.WordWrap
             text: "This widget reads the deliveries you track in the Parcel app through its Premium API. Create an API key at web.parcelapp.net, then store it in your keyring:"
@@ -414,6 +418,7 @@ Panel {
 
             Text {
               id: setupCommand
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.margins: Style.space(8)
@@ -448,6 +453,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             wrapMode: Text.WordWrap
             text: "secret-tool prompts for the key so it never touches your shell history. Press r here once it is stored."
@@ -459,6 +465,7 @@ Panel {
 
         // ---- Error with nothing cached to show.
         Text {
+          textFormat: Text.PlainText
           visible: root.showingError && root.deliveries.length === 0
           width: parent.width
           wrapMode: Text.WordWrap
@@ -470,6 +477,7 @@ Panel {
 
         // ---- Empty.
         Text {
+          textFormat: Text.PlainText
           visible: !root.needsSetup && !root.showingError && root.everLoaded && root.deliveries.length === 0
           text: root.filterMode === "recent" ? "Nothing tracked recently." : "Nothing on the way right now."
           color: root.dim
@@ -534,6 +542,7 @@ Panel {
 
                     Text {
                       id: statusGlyph
+                      textFormat: Text.PlainText
                       width: Style.space(22)
                       anchors.verticalCenter: parent.verticalCenter
                       text: row.modelData.glyph
@@ -549,6 +558,7 @@ Panel {
                       spacing: Style.space(2)
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: row.modelData.description
                         color: row.modelData.tone === "muted" ? root.dim : root.foreground
@@ -557,6 +567,7 @@ Panel {
                         elide: Text.ElideRight
                       }
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: row.modelData.carrierName
                           + (row.modelData.latestEvent && row.modelData.latestEvent.event ? " · " + row.modelData.latestEvent.event : "")
@@ -575,6 +586,7 @@ Panel {
 
                       Text {
                         id: etaText
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: row.eta
                         color: root.foreground
@@ -584,6 +596,7 @@ Panel {
                       }
                       Text {
                         id: statusText
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: row.modelData.status.toUpperCase()
                         color: row.statusColor
@@ -612,6 +625,7 @@ Panel {
 
                         Text {
                           id: eventTime
+                          textFormat: Text.PlainText
                           width: Style.space(112)
                           text: Model.formatEventTime(eventRow.modelData.date, root.now)
                           color: root.dim
@@ -619,6 +633,7 @@ Panel {
                           font.pixelSize: Style.font.caption
                         }
                         Text {
+                          textFormat: Text.PlainText
                           width: eventRow.width - eventTime.width - eventRow.spacing
                           text: eventRow.modelData.event
                             + (eventRow.modelData.location ? " — " + eventRow.modelData.location : "")
@@ -631,6 +646,7 @@ Panel {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       visible: row.modelData.events.length === 0
                       text: "No checkpoints yet."
                       color: root.dim
@@ -640,6 +656,7 @@ Panel {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       text: (row.modelData.trackingNumber ? row.modelData.trackingNumber + " · " : "")
                         + row.modelData.carrierName + "  ·  y to copy tracking number"
@@ -673,6 +690,7 @@ Panel {
           visible: root.everLoaded || root.stale
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: root.updatedText
             color: root.stale ? root.urgent : root.dim
@@ -681,6 +699,7 @@ Panel {
             wrapMode: Text.WordWrap
           }
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: "↑↓ select · ⏎ details · y copy · r refresh · o open Parcel"
             color: root.dim

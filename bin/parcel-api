@@ -26,6 +26,11 @@
 # good deliveries response is cached under $XDG_STATE_HOME/omarchy/parcel so a
 # shell restart or a panel open never burns a request, and --max-age lets the
 # caller decide how fresh is fresh enough.
+#
+# Everything this script reads is treated as hostile: the state directory sits
+# at a predictable path, so no file in it is opened through a symlink or
+# truncated on open, and neither a cache nor an HTTP body is handed to jq
+# before its size is bounded.
 
 set -euo pipefail
 
@@ -35,6 +40,11 @@ readonly API="https://api.parcel.app/external"
 readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/parcel"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly BUNDLED_CARRIERS="$SCRIPT_DIR/../data/carriers.json"
+
+# Nothing legitimate here is close to this big: a full deliveries response with
+# every event is tens of kilobytes, and supported_carriers.json is ~11 KB. It
+# is the ceiling on any single thing we read into memory or feed to jq.
+readonly MAX_BYTES=$((1024 * 1024))
 
 usage() {
   sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
@@ -52,8 +62,84 @@ need() {
   done
 }
 
+# ---- State directory ---------------------------------------------------------
+#
+# $STATE_DIR/... are guessable paths that any same-uid process can create ahead
+# of us. A planted symlink there would otherwise make us truncate, read or
+# write whatever it points at, so every open goes through these two helpers.
+
+readonly STATE_BASE="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+# The two components we own (omarchy/parcel) must be real directories. The base
+# is the user's to arrange however they like (a symlinked ~/.local/state is
+# fine), so the check is that the resolved dir sits under the resolved base.
+ensure_state_dir() {
+  [[ -L "$STATE_BASE/omarchy" || -L "$STATE_DIR" ]] \
+    && fail "unsafe-state" "$STATE_DIR is reached through a symlink; refusing to use it."
+  mkdir -p "$STATE_DIR" 2>/dev/null || fail "unsafe-state" "Could not create $STATE_DIR"
+  [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+    || fail "unsafe-state" "$STATE_DIR is not a plain directory; refusing to use it."
+  local real_dir real_base
+  real_dir="$(cd "$STATE_DIR" 2>/dev/null && pwd -P)" || fail "unsafe-state" "Cannot resolve $STATE_DIR"
+  real_base="$(cd "$STATE_BASE" 2>/dev/null && pwd -P)" || fail "unsafe-state" "Cannot resolve $STATE_BASE"
+  [[ "$real_dir" == "$real_base/omarchy/parcel" ]] \
+    || fail "unsafe-state" "$STATE_DIR resolves outside $STATE_BASE; refusing to use it."
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+}
+
+# A path we may open: either absent, or a plain regular file — never a symlink,
+# fifo or device.
+safe_path() { # <path>
+  [[ -L "$1" ]] && return 1
+  [[ -e "$1" && ! -f "$1" ]] && return 1
+  return 0
+}
+
+file_size() { # <path> → bytes, 0 if unknown
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0
+}
+
+# Is this cache safe to parse? Present, non-empty, a real file, and small
+# enough that jq can hold it. A cache that fails any of these reads as absent.
+usable_cache() { # <path>
+  safe_path "$1" || return 1
+  [[ -s "$1" ]] || return 1
+  (( $(file_size "$1") <= MAX_BYTES )) || return 1
+  return 0
+}
+
+# Bounded read: head caps the bytes that reach jq even if the file grows or is
+# swapped between the check above and the read here, and timeout stops a swap
+# to a FIFO from blocking us forever. (bash cannot open O_NOFOLLOW; a swap to a
+# symlink between check and read is a bounded, same-uid read of a file that
+# process could already read itself.)
+cache_bytes() { # <path>
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 head -c "$MAX_BYTES" "$1"
+  else
+    head -c "$MAX_BYTES" "$1"
+  fi
+}
+
+# The key is written into a curl config file as header = "api-key: <key>".
+# Backslash and double quote are escaped the way curl's parser expects; a
+# control character (newline especially) would end the directive, so it is the
+# one thing refused.
+key_is_clean() { # <key>
+  [[ "$1" != *[![:print:]]* ]]
+}
+
+curl_config_quote() { # <string> → the string escaped for a "..." curl config value
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  printf '%s' "$v"
+}
+
+# Exit 1: no key. Exit 2: a key is stored but unusable.
 api_key() {
   if [[ -n "${PARCEL_API_KEY:-}" ]]; then
+    key_is_clean "$PARCEL_API_KEY" || return 2
     printf '%s' "$PARCEL_API_KEY"
     return 0
   fi
@@ -61,6 +147,7 @@ api_key() {
   local key
   key="$(secret-tool lookup service "$SERVICE" key "$KEY_ATTR" 2>/dev/null || true)"
   [[ -n "$key" ]] || return 1
+  key_is_clean "$key" || return 2
   printf '%s' "$key"
 }
 
@@ -69,17 +156,69 @@ api_key() {
 # captured response body.
 KEY=""
 require_key() {
-  KEY="$(api_key)" || fail "no-key" "No Parcel API key found. Store one with: secret-tool store --label='Parcel API key' service $SERVICE key $KEY_ATTR"
+  local rc=0
+  KEY="$(api_key)" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) fail "bad-key" "The stored Parcel API key contains control characters. Re-create it at web.parcelapp.net and store it again." ;;
+    *) fail "no-key" "No Parcel API key found. Store one with: secret-tool store --label='Parcel API key' service $SERVICE key $KEY_ATTR" ;;
+  esac
 }
 
-# curl wrapper: prints "<body>\n<http-code>" — caller splits. The key travels
-# to curl as a config file on stdin (-K -), so it never appears in curl's argv
-# where other same-user processes could read it.
-request() { # <method> <url> [json-body]
+# ---- HTTP --------------------------------------------------------------------
+#
+# The response body is written to a private temp file through `head -c`, so the
+# most we ever store or parse is MAX_BYTES no matter what the server sends or
+# claims to send — --max-filesize alone can't be trusted for a chunked reply.
+# The status code comes back on stderr via %{stderr} so it survives that cap.
+# The key travels to curl as a config file on stdin (-K -), never in argv where
+# other same-user processes could read it.
+
+BODY_FILE=""
+CODE_FILE=""
+HTTP_CODE=""
+cleanup() { [[ -n "$BODY_FILE" ]] && rm -f "$BODY_FILE" "$CODE_FILE"; return 0; }
+trap cleanup EXIT
+
+scratch_files() {
+  [[ -n "$BODY_FILE" ]] && return 0
+  BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/parcel-api.body.XXXXXX")"
+  CODE_FILE="$(mktemp "${TMPDIR:-/tmp}/parcel-api.code.XXXXXX")"
+}
+
+request() { # <method> <url> [json-body] → 0 with $HTTP_CODE set; body in $BODY_FILE
   local method="$1" url="$2" body="${3:-}"
-  local -a args=(-K - -sS --max-time 15 -w $'\n%{http_code}' -X "$method")
+  scratch_files
+  : >"$BODY_FILE"
+  : >"$CODE_FILE"
+  local -a args=(-s --proto '=https' --max-time 15 --max-filesize "$MAX_BYTES"
+                 -H "Accept: application/json" -o - -w '%{stderr}%{http_code}' -X "$method")
   [[ -n "$body" ]] && args+=(-H "Content-Type: application/json" --data "$body")
-  printf 'header = "api-key: %s"\n' "$KEY" | curl "${args[@]}" "$url" 2>/dev/null
+  local config=""
+  if [[ -n "$KEY" ]]; then
+    args=(-K - "${args[@]}")
+    config="$(printf 'header = "api-key: %s"\n' "$(curl_config_quote "$KEY")")"
+  fi
+  local -a st
+  printf '%s' "$config" \
+    | curl "${args[@]}" "$url" 2>"$CODE_FILE" \
+    | head -c "$MAX_BYTES" >"$BODY_FILE" && st=(0 0 0) || st=("${PIPESTATUS[@]}")
+  HTTP_CODE="$(tr -cd '0-9' <"$CODE_FILE" | head -c 3)"
+  [[ "${st[2]}" == 0 ]] || return 1                        # could not write the body
+  case "${st[1]}" in
+    0) ;;
+    # 23 = write error (head closed the pipe), 63 = --max-filesize: both mean
+    # "the body hit the cap", which the caller reports as too-large. Anything
+    # else — a connection dropped mid-body included — is a failed transfer.
+    23|63) (( $(file_size "$BODY_FILE") >= MAX_BYTES )) || return 1 ;;
+    *) return 1 ;;
+  esac
+  [[ -n "$HTTP_CODE" && "$HTTP_CODE" != "000" ]]
+}
+
+response_body() {
+  [[ -s "$BODY_FILE" ]] && cat "$BODY_FILE"
+  return 0
 }
 
 file_age() { # <path> → seconds since modification, or a huge number
@@ -93,17 +232,29 @@ file_age() { # <path> → seconds since modification, or a huge number
 }
 
 write_cache() { # <path> <json>
-  mkdir -p "$STATE_DIR"
+  ensure_state_dir
+  safe_path "$1" || fail "unsafe-state" "Refusing to write through $1"
   local tmp
   tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")"
   (umask 077; printf '%s\n' "$2" > "$tmp")
   chmod 600 "$tmp"
-  mv -f "$tmp" "$1"
+  mv -f "$tmp" "$1"   # rename(2) replaces the name, it never follows a symlink
+}
+
+# Read a cache through jq. Output is captured and printed only if jq succeeds,
+# so a corrupt cache (say a valid object with junk appended) can never put one
+# JSON document on stdout and then let a second one follow it.
+emit_cache() { # <cache-path> <jq-filter> [jq-args...]
+  local path="$1" filter="$2" out
+  shift 2
+  usable_cache "$path" || return 1
+  out="$(cache_bytes "$path" | jq -c "$@" "$filter" 2>/dev/null)" || return 1
+  [[ -n "$out" && "$out" != *$'\n'* ]] || return 1
+  printf '%s\n' "$out"
 }
 
 serve_cache_or_fail() { # <cache-path> <error-code> <message>
-  if [[ -s "$1" ]]; then
-    jq -c --arg code "$2" --arg message "$3" '. + {stale:true, error:$code, message:$message}' "$1"
+  if emit_cache "$1" '. + {stale:true, error:$code, message:$message}' --arg code "$2" --arg message "$3"; then
     exit 0
   fi
   fail "$2" "$3"
@@ -123,14 +274,18 @@ cmd_deliveries() {
   done
   [[ "$max_age" =~ ^[0-9]+$ ]] || usage
 
+  ensure_state_dir
   local cache="$STATE_DIR/deliveries-$mode.json"
-  mkdir -p "$STATE_DIR"
 
   # One panel instance exists per monitor and they all poll on the same
   # schedule. Serialise callers so the first one fetches and the rest find a
   # fresh cache inside the lock — several monitors cost one API request.
-  if command -v flock >/dev/null 2>&1; then
-    exec 9>"$STATE_DIR/.deliveries-$mode.lock"
+  #
+  # The lock is taken on the state directory itself (opened read-only), so
+  # there is no lock file at a guessable path to plant, truncate or redirect.
+  # A timed-out or failed lock falls through to an unserialised fetch: a
+  # duplicate request beats a panel that never loads.
+  if command -v flock >/dev/null 2>&1 && exec 9<"$STATE_DIR" 2>/dev/null; then
     flock -w 30 9 || true
   fi
 
@@ -138,24 +293,27 @@ cmd_deliveries() {
   # fresh, so a broadcast refresh across monitors is also a single request.
   local effective_max_age="$max_age"
   (( effective_max_age < 10 )) && effective_max_age=10
-  if [[ -s "$cache" ]] && (( $(file_age "$cache") < effective_max_age )); then
-    jq -c '. + {cached:true}' "$cache"
+  # An unparseable cache falls through to a fetch instead of aborting.
+  if usable_cache "$cache" && (( $(file_age "$cache") < effective_max_age )) \
+     && emit_cache "$cache" '. + {cached:true}'; then
     return 0
   fi
 
   require_key
-  local raw code body
-  if ! raw="$(request GET "$API/deliveries/?filter_mode=$mode")"; then
+  local body
+  if ! request GET "$API/deliveries/?filter_mode=$mode"; then
     serve_cache_or_fail "$cache" "network" "Could not reach api.parcel.app"
   fi
-  code="${raw##*$'\n'}"
-  body="${raw%$'\n'*}"
+  if (( $(file_size "$BODY_FILE") >= MAX_BYTES )); then
+    serve_cache_or_fail "$cache" "too-large" "Parcel returned an oversized response."
+  fi
+  body="$(response_body)"
 
-  case "$code" in
+  case "$HTTP_CODE" in
     200) ;;
-    401|403) fail "auth" "Parcel rejected the API key (HTTP $code). Re-create it at web.parcelapp.net and store it again." ;;
+    401|403) fail "auth" "Parcel rejected the API key (HTTP $HTTP_CODE). Re-create it at web.parcelapp.net and store it again." ;;
     429) serve_cache_or_fail "$cache" "rate-limited" "Parcel rate limit reached (20 requests/hour). Showing the last good data." ;;
-    *) serve_cache_or_fail "$cache" "http-$code" "Unexpected response from Parcel (HTTP $code)." ;;
+    *) serve_cache_or_fail "$cache" "http-$HTTP_CODE" "Unexpected response from Parcel (HTTP $HTTP_CODE)." ;;
   esac
 
   if ! jq -e 'type == "object"' <<<"$body" >/dev/null 2>&1; then
@@ -163,7 +321,7 @@ cmd_deliveries() {
   fi
   if [[ "$(jq -r '.success' <<<"$body")" != "true" ]]; then
     local msg
-    msg="$(jq -r '.error_message // "Parcel reported an error."' <<<"$body")"
+    msg="$(jq -r '(.error_message // "Parcel reported an error.") | tostring | .[0:200]' <<<"$body")"
     serve_cache_or_fail "$cache" "api" "$msg"
   fi
   # A "successful" body without a deliveries array is not a result we can
@@ -172,9 +330,17 @@ cmd_deliveries() {
     serve_cache_or_fail "$cache" "bad-response" "Parcel returned no deliveries list."
   fi
 
+  # Cap the list here too: the widget clamps what it renders, but the cache is
+  # what a later run parses, and it should never grow past what we just read.
+  # Non-object deliveries are dropped and a non-array .events becomes [] —
+  # Model.js would ignore them anyway, and the shaping must never be the thing
+  # that turns a usable response into an empty stdout.
   local out
-  out="$(jq -c --arg mode "$mode" --argjson now "$(date +%s)" \
-    '{ok:true, mode:$mode, fetchedAt:$now, cached:false, stale:false, deliveries:(.deliveries // [])}' <<<"$body")"
+  out="$(jq -c --arg mode "$mode" --argjson now "$(date +%s)" '
+    {ok:true, mode:$mode, fetchedAt:$now, cached:false, stale:false,
+     deliveries:(.deliveries[0:200] | map(select(type == "object")
+       | .events = (if (.events | type) == "array" then .events[0:50] else [] end)))}' <<<"$body")" \
+    || serve_cache_or_fail "$cache" "bad-response" "Parcel returned a deliveries list we could not read."
   write_cache "$cache" "$out"
   printf '%s\n' "$out"
 }
@@ -185,40 +351,46 @@ cmd_add() {
   local tracking="$1" carrier="$2" description="$3"
   [[ -n "$tracking" && -n "$carrier" && -n "$description" ]] || usage
   require_key
-  local payload raw code body
+  local payload body
   payload="$(jq -cn --arg t "$tracking" --arg c "$carrier" --arg d "$description" \
     '{tracking_number:$t, carrier_code:$c, description:$d, send_push_confirmation:true}')"
-  if ! raw="$(request POST "$API/add-delivery/" "$payload")"; then
+  if ! request POST "$API/add-delivery/" "$payload"; then
     fail "network" "Could not reach api.parcel.app"
   fi
-  code="${raw##*$'\n'}"
-  body="${raw%$'\n'*}"
-  case "$code" in
+  body="$(response_body)"
+  case "$HTTP_CODE" in
     200) ;;
-    401|403) fail "auth" "Parcel rejected the API key (HTTP $code)." ;;
+    401|403) fail "auth" "Parcel rejected the API key (HTTP $HTTP_CODE)." ;;
     429) fail "rate-limited" "Parcel add-delivery limit reached (20 per day)." ;;
-    *) fail "http-$code" "Unexpected response from Parcel (HTTP $code)." ;;
+    *) fail "http-$HTTP_CODE" "Unexpected response from Parcel (HTTP $HTTP_CODE)." ;;
   esac
   if [[ "$(jq -r '.success' <<<"$body" 2>/dev/null)" == "true" ]]; then
     jq -cn --arg t "$tracking" --arg c "$carrier" --arg d "$description" \
       '{ok:true, added:{tracking_number:$t, carrier_code:$c, description:$d}}'
   else
-    fail "api" "$(jq -r '.error_message // "Parcel could not add the delivery."' <<<"$body" 2>/dev/null)"
+    fail "api" "$(jq -r '(.error_message // "Parcel could not add the delivery.") | tostring | .[0:200]' <<<"$body" 2>/dev/null)"
   fi
 }
 
 cmd_carriers() {
   need jq
+  ensure_state_dir
   local cache="$STATE_DIR/carriers.json"
   if [[ "${1:-}" == "--refresh" ]]; then
     need curl
-    local fresh
-    if fresh="$(curl -sS --max-time 15 "$API/supported_carriers.json" 2>/dev/null)" && jq -e 'type == "object"' <<<"$fresh" >/dev/null 2>&1; then
-      write_cache "$cache" "$fresh"
+    KEY=""
+    if request GET "$API/supported_carriers.json" \
+       && [[ "$HTTP_CODE" == "200" ]] \
+       && (( $(file_size "$BODY_FILE") < MAX_BYTES )); then
+      local fresh
+      fresh="$(response_body)"
+      if jq -e 'type == "object"' <<<"$fresh" >/dev/null 2>&1; then
+        write_cache "$cache" "$fresh"
+      fi
     fi
   fi
-  if [[ -s "$cache" ]]; then
-    jq -c '{ok:true, source:"cache", carriers:.}' "$cache"
+  if emit_cache "$cache" '{ok:true, source:"cache", carriers:.}'; then
+    :
   elif [[ -s "$BUNDLED_CARRIERS" ]]; then
     jq -c '{ok:true, source:"bundled", carriers:.}' "$BUNDLED_CARRIERS"
   else
@@ -232,7 +404,10 @@ cmd_status() {
   command -v secret-tool >/dev/null 2>&1 && has_secret_tool=true
   api_key >/dev/null 2>&1 && has_key=true
   local cache="$STATE_DIR/deliveries-active.json" cached_at=null
-  [[ -s "$cache" ]] && cached_at="$(jq -r '.fetchedAt // null' "$cache")"
+  if usable_cache "$cache"; then
+    cached_at="$(cache_bytes "$cache" | jq -r '(.fetchedAt // null) | tostring' 2>/dev/null | head -n1 || true)"
+    [[ "$cached_at" =~ ^[0-9]+$ ]] || cached_at=null
+  fi
   jq -cn --argjson hasKey "$has_key" --argjson secretTool "$has_secret_tool" \
     --arg stateDir "$STATE_DIR" --argjson cachedAt "$cached_at" \
     '{ok:true, hasKey:$hasKey, secretTool:$secretTool, stateDir:$stateDir, lastFetchedAt:$cachedAt}'
