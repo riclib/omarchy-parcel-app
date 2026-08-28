@@ -2,6 +2,8 @@
 
 Your [Parcel](https://parcelapp.net) deliveries in the Omarchy bar.
 
+![Parcel panel showing three deliveries with an expanded checkpoint timeline](preview.png)
+
 A bar badge shows how many parcels are on the way and lights up when one is
 out for delivery (or needs attention). Click it for a panel listing every
 active shipment with carrier, latest checkpoint and ETA; expand a row for the

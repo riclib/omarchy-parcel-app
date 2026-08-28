@@ -221,16 +221,12 @@ function summaryLine(list) {
   if (!active.length) return "No active deliveries"
   var counts = {}
   for (var i = 0; i < active.length; i++) counts[active[i].status] = (counts[active[i].status] || 0) + 1
-  var parts = []
-  var order = sortDeliveries(active)
-  var seen = {}
-  for (var j = 0; j < order.length; j++) {
-    var s = order[j].status
-    if (seen[s]) continue
-    seen[s] = true
-    parts.push(counts[s] + " " + s.toLowerCase())
-  }
-  return active.length + (active.length === 1 ? " delivery" : " deliveries") + " · " + parts.join(", ")
+  // Lead state only: the full breakdown elided in the panel header on a
+  // 460px card, and the list below it already shows every state.
+  var lead = sortDeliveries(active)[0].status
+  var head = active.length + (active.length === 1 ? " delivery" : " deliveries")
+  if (active.length === 1) return head + " · " + lead.toLowerCase()
+  return head + " · " + counts[lead] + " " + lead.toLowerCase()
 }
 
 // "Today", "Today 10:00–14:00", "Tomorrow", "Fri 30 Aug", "Overdue (Mon 24 Aug)"
