@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.zuccs.parcel",
+  "name": "Parcel",
+  "version": "0.1.0",
+  "author": "Daniel Zuccon",
+  "license": "MIT",
+  "description": "Your Parcel app deliveries in the Omarchy bar: a status-tinted badge, active shipments with ETAs, event timelines, and desktop notifications when a parcel moves.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Parcel",
+    "description": "Deliveries tracked in the Parcel app (parcelapp.net), read through its Premium API. Badge shows the count and the most urgent state; the panel lists shipments, ETAs and checkpoint timelines.",
+    "category": "Info",
+    "aliases": ["parcel", "deliveries", "packages"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 600,
+      "filterMode": "active",
+      "notifications": "On",
+      "hideWhenEmpty": "Off"
+    },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 300, "max": 3600, "step": 60, "defaultValue": 600, "description": "Parcel allows 20 requests per hour. 300 s is the floor; manual refreshes count too." },
+      { "key": "filterMode", "type": "enum", "label": "Deliveries to show", "options": ["active", "recent"], "defaultValue": "active", "description": "active = in progress only. recent = also includes recently delivered parcels." },
+      { "key": "notifications", "type": "enum", "label": "Notify on status change", "options": ["On", "Off"], "defaultValue": "On", "description": "Desktop notification when a parcel changes state, e.g. goes out for delivery." },
+      { "key": "hideWhenEmpty", "type": "enum", "label": "Hide badge when nothing is active", "options": ["On", "Off"], "defaultValue": "Off" }
+    ]
+  }
+}

@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+#
+# parcel-api — the only thing in this plugin that talks to the network.
+#
+# A thin bridge between the Omarchy Parcel bar widget and the Parcel app's
+# Premium API (https://parcelapp.net/help/api.html). Keeping it in one small
+# bash script means the QML never sees the API key, the behaviour is auditable
+# in a minute, and it can be tested from any terminal without Omarchy.
+#
+# Usage:
+#   parcel-api deliveries [active|recent] [--max-age SECONDS]
+#   parcel-api add <tracking-number> <carrier-code> <description>
+#   parcel-api carriers [--refresh]
+#   parcel-api status
+#
+# Every command prints exactly one JSON object on stdout. API and network
+# failures are reported inside that object as {"ok":false,"error":...} with
+# exit code 0, so the caller has one code path; exit 64 means a usage error.
+#
+# The API key is read from the login keyring (libsecret, preinstalled on
+# Omarchy) under service=omarchy-parcel key=api-key. Store it once with:
+#   secret-tool store --label='Parcel API key' service omarchy-parcel key api-key
+# PARCEL_API_KEY in the environment overrides the keyring (for tests/CI only).
+#
+# Rate limits (Parcel's, not ours): deliveries 20/hour, add 20/day. The last
+# good deliveries response is cached under $XDG_STATE_HOME/omarchy/parcel so a
+# shell restart or a panel open never burns a request, and --max-age lets the
+# caller decide how fresh is fresh enough.
+
+set -euo pipefail
+
+readonly SERVICE="omarchy-parcel"
+readonly KEY_ATTR="api-key"
+readonly API="https://api.parcel.app/external"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/parcel"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly BUNDLED_CARRIERS="$SCRIPT_DIR/../data/carriers.json"
+
+usage() {
+  sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+}
+
+fail() { # <code> <message>  — machine-readable failure, exit 0
+  jq -cn --arg code "$1" --arg message "$2" '{ok:false, error:$code, message:$message}'
+  exit 0
+}
+
+need() {
+  for tool in "$@"; do
+    command -v "$tool" >/dev/null 2>&1 || fail "missing-tool" "Required tool not found: $tool"
+  done
+}
+
+api_key() {
+  if [[ -n "${PARCEL_API_KEY:-}" ]]; then
+    printf '%s' "$PARCEL_API_KEY"
+    return 0
+  fi
+  command -v secret-tool >/dev/null 2>&1 || return 1
+  local key
+  key="$(secret-tool lookup service "$SERVICE" key "$KEY_ATTR" 2>/dev/null || true)"
+  [[ -n "$key" ]] || return 1
+  printf '%s' "$key"
+}
+
+# Resolve the key in the main shell (not inside a $(...) capture) so a missing
+# key becomes a clean {"ok":false,"error":"no-key"} instead of leaking into a
+# captured response body.
+KEY=""
+require_key() {
+  KEY="$(api_key)" || fail "no-key" "No Parcel API key found. Store one with: secret-tool store --label='Parcel API key' service $SERVICE key $KEY_ATTR"
+}
+
+# curl wrapper: prints "<body>\n<http-code>" — caller splits. The key travels
+# to curl as a config file on stdin (-K -), so it never appears in curl's argv
+# where other same-user processes could read it.
+request() { # <method> <url> [json-body]
+  local method="$1" url="$2" body="${3:-}"
+  local -a args=(-K - -sS --max-time 15 -w $'\n%{http_code}' -X "$method")
+  [[ -n "$body" ]] && args+=(-H "Content-Type: application/json" --data "$body")
+  printf 'header = "api-key: %s"\n' "$KEY" | curl "${args[@]}" "$url" 2>/dev/null
+}
+
+file_age() { # <path> → seconds since modification, or a huge number
+  local now mtime
+  now="$(date +%s)"
+  if mtime="$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)"; then
+    echo $(( now - mtime ))
+  else
+    echo 999999999
+  fi
+}
+
+write_cache() { # <path> <json>
+  mkdir -p "$STATE_DIR"
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.tmp.XXXXXX")"
+  (umask 077; printf '%s\n' "$2" > "$tmp")
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$1"
+}
+
+serve_cache_or_fail() { # <cache-path> <error-code> <message>
+  if [[ -s "$1" ]]; then
+    jq -c --arg code "$2" --arg message "$3" '. + {stale:true, error:$code, message:$message}' "$1"
+    exit 0
+  fi
+  fail "$2" "$3"
+}
+
+cmd_deliveries() {
+  need curl jq
+  local mode="active" max_age=0
+  while (($#)); do
+    case "$1" in
+      active|recent) mode="$1" ;;
+      --max-age) shift; max_age="${1:-0}" ;;
+      --max-age=*) max_age="${1#--max-age=}" ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  [[ "$max_age" =~ ^[0-9]+$ ]] || usage
+
+  local cache="$STATE_DIR/deliveries-$mode.json"
+  mkdir -p "$STATE_DIR"
+
+  # One panel instance exists per monitor and they all poll on the same
+  # schedule. Serialise callers so the first one fetches and the rest find a
+  # fresh cache inside the lock — several monitors cost one API request.
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$STATE_DIR/.deliveries-$mode.lock"
+    flock -w 30 9 || true
+  fi
+
+  # A forced refresh (--max-age 0) still treats a cache under 10 s old as
+  # fresh, so a broadcast refresh across monitors is also a single request.
+  local effective_max_age="$max_age"
+  (( effective_max_age < 10 )) && effective_max_age=10
+  if [[ -s "$cache" ]] && (( $(file_age "$cache") < effective_max_age )); then
+    jq -c '. + {cached:true}' "$cache"
+    return 0
+  fi
+
+  require_key
+  local raw code body
+  if ! raw="$(request GET "$API/deliveries/?filter_mode=$mode")"; then
+    serve_cache_or_fail "$cache" "network" "Could not reach api.parcel.app"
+  fi
+  code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+
+  case "$code" in
+    200) ;;
+    401|403) fail "auth" "Parcel rejected the API key (HTTP $code). Re-create it at web.parcelapp.net and store it again." ;;
+    429) serve_cache_or_fail "$cache" "rate-limited" "Parcel rate limit reached (20 requests/hour). Showing the last good data." ;;
+    *) serve_cache_or_fail "$cache" "http-$code" "Unexpected response from Parcel (HTTP $code)." ;;
+  esac
+
+  if ! jq -e 'type == "object"' <<<"$body" >/dev/null 2>&1; then
+    serve_cache_or_fail "$cache" "bad-response" "Parcel returned something that is not JSON."
+  fi
+  if [[ "$(jq -r '.success' <<<"$body")" != "true" ]]; then
+    local msg
+    msg="$(jq -r '.error_message // "Parcel reported an error."' <<<"$body")"
+    serve_cache_or_fail "$cache" "api" "$msg"
+  fi
+  # A "successful" body without a deliveries array is not a result we can
+  # trust — never cache it, and never let it read as "nothing on the way".
+  if ! jq -e '.deliveries | type == "array"' <<<"$body" >/dev/null 2>&1; then
+    serve_cache_or_fail "$cache" "bad-response" "Parcel returned no deliveries list."
+  fi
+
+  local out
+  out="$(jq -c --arg mode "$mode" --argjson now "$(date +%s)" \
+    '{ok:true, mode:$mode, fetchedAt:$now, cached:false, stale:false, deliveries:(.deliveries // [])}' <<<"$body")"
+  write_cache "$cache" "$out"
+  printf '%s\n' "$out"
+}
+
+cmd_add() {
+  need curl jq
+  (($# == 3)) || usage
+  local tracking="$1" carrier="$2" description="$3"
+  [[ -n "$tracking" && -n "$carrier" && -n "$description" ]] || usage
+  require_key
+  local payload raw code body
+  payload="$(jq -cn --arg t "$tracking" --arg c "$carrier" --arg d "$description" \
+    '{tracking_number:$t, carrier_code:$c, description:$d, send_push_confirmation:true}')"
+  if ! raw="$(request POST "$API/add-delivery/" "$payload")"; then
+    fail "network" "Could not reach api.parcel.app"
+  fi
+  code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  case "$code" in
+    200) ;;
+    401|403) fail "auth" "Parcel rejected the API key (HTTP $code)." ;;
+    429) fail "rate-limited" "Parcel add-delivery limit reached (20 per day)." ;;
+    *) fail "http-$code" "Unexpected response from Parcel (HTTP $code)." ;;
+  esac
+  if [[ "$(jq -r '.success' <<<"$body" 2>/dev/null)" == "true" ]]; then
+    jq -cn --arg t "$tracking" --arg c "$carrier" --arg d "$description" \
+      '{ok:true, added:{tracking_number:$t, carrier_code:$c, description:$d}}'
+  else
+    fail "api" "$(jq -r '.error_message // "Parcel could not add the delivery."' <<<"$body" 2>/dev/null)"
+  fi
+}
+
+cmd_carriers() {
+  need jq
+  local cache="$STATE_DIR/carriers.json"
+  if [[ "${1:-}" == "--refresh" ]]; then
+    need curl
+    local fresh
+    if fresh="$(curl -sS --max-time 15 "$API/supported_carriers.json" 2>/dev/null)" && jq -e 'type == "object"' <<<"$fresh" >/dev/null 2>&1; then
+      write_cache "$cache" "$fresh"
+    fi
+  fi
+  if [[ -s "$cache" ]]; then
+    jq -c '{ok:true, source:"cache", carriers:.}' "$cache"
+  elif [[ -s "$BUNDLED_CARRIERS" ]]; then
+    jq -c '{ok:true, source:"bundled", carriers:.}' "$BUNDLED_CARRIERS"
+  else
+    fail "no-carriers" "No carrier list available."
+  fi
+}
+
+cmd_status() {
+  need jq
+  local has_key=false has_secret_tool=false
+  command -v secret-tool >/dev/null 2>&1 && has_secret_tool=true
+  api_key >/dev/null 2>&1 && has_key=true
+  local cache="$STATE_DIR/deliveries-active.json" cached_at=null
+  [[ -s "$cache" ]] && cached_at="$(jq -r '.fetchedAt // null' "$cache")"
+  jq -cn --argjson hasKey "$has_key" --argjson secretTool "$has_secret_tool" \
+    --arg stateDir "$STATE_DIR" --argjson cachedAt "$cached_at" \
+    '{ok:true, hasKey:$hasKey, secretTool:$secretTool, stateDir:$stateDir, lastFetchedAt:$cachedAt}'
+}
+
+(($#)) || usage
+cmd="$1"; shift
+case "$cmd" in
+  deliveries) cmd_deliveries "$@" ;;
+  add) cmd_add "$@" ;;
+  carriers) cmd_carriers "$@" ;;
+  status) cmd_status "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac
