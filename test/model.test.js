@@ -14,8 +14,8 @@ const carriers = { au: "Australia Post", fedex: "FedEx", fastau: "Fastway (Arame
 const SAMPLE = [
   { carrier_code: "au", description: "Garden hose", status_code: 3, tracking_number: "AAA111",
     events: [
-      { event: "In transit", date: "27.08.2026 07:41", location: "RICHMOND VIC" },
-      { event: "Awaiting collection at RICHMOND PO", date: "27.08.2026 07:47", location: "RICHMOND VIC" }
+      { event: "In transit", date: "27.08.2026 07:41", location: "SPRINGFIELD" },
+      { event: "Awaiting collection at SPRINGFIELD PO", date: "27.08.2026 07:47", location: "SPRINGFIELD" }
     ] },
   { carrier_code: "fastau", description: "Board game", status_code: 4, tracking_number: "BBB222", date_expected: "2026-08-28 00:00:00", events: [] },
   { carrier_code: "fedex", description: "Headphones", status_code: 2, tracking_number: "CCC333",
@@ -50,9 +50,9 @@ test("parseResponse normalises, sorts by urgency, and never throws", () => {
   assert.deepEqual(r.deliveries.map(d => d.description), ["Board game", "Garden hose", "Headphones", "Library book"])
   const rack = r.deliveries[0]
   assert.equal(rack.status, "Out for delivery"); assert.equal(rack.tone, "urgent"); assert.equal(rack.carrierName, "Fastway (Aramex)")
-  const coffee = r.deliveries[1]
-  assert.equal(coffee.latestEvent.event, "Awaiting collection at RICHMOND PO", "events are ordered newest first regardless of input order")
-  assert.equal(coffee.key, "au:AAA111")
+  const hose = r.deliveries[1]
+  assert.equal(hose.latestEvent.event, "Awaiting collection at SPRINGFIELD PO", "events are ordered newest first regardless of input order")
+  assert.equal(hose.key, "au:AAA111")
   assert.equal(r.fetchedAt, 1787000000 * 1000)
 
   assert.equal(Model.parseResponse("", carriers).ok, false)
@@ -122,7 +122,7 @@ test("diffStatuses reports transitions and disappearances, ignores first sightin
   const after = Model.parseResponse(response(afterRaw), carriers).deliveries
   const changes = Model.diffStatuses(before, after)
   const byDesc = Object.fromEntries(changes.map(c => [c.description, c]))
-  assert.deepEqual(Object.keys(byDesc).sort(), ["Garden hose", "Board game", "Headphones"])
+  assert.deepEqual(Object.keys(byDesc).sort(), ["Board game", "Garden hose", "Headphones"])
   assert.equal(byDesc["Headphones"].to, "Out for delivery")
   assert.equal(byDesc["Garden hose"].to, "Delivered")
   assert.equal(byDesc["Board game"].to, Model.NO_LONGER_ACTIVE, "disappearance is not inferred as delivered")
