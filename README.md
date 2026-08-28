@@ -134,12 +134,12 @@ like every Omarchy bar widget. The defaults:
 ## Development
 
 ```bash
-git clone https://github.com/zuccs/omarchy-parcel-app.git ~/.config/omarchy/plugins/io.github.zuccs.parcel
-omarchy-shell shell rescanPlugins
-omarchy plugin enable io.github.zuccs.parcel
+# Install the normal way — the result is a plain git checkout you can edit in place.
+omarchy plugin add https://github.com/zuccs/omarchy-parcel-app.git --enable
+cd ~/.config/omarchy/plugins/io.github.zuccs.parcel
 
-omarchy plugin validate ~/.config/omarchy/plugins/io.github.zuccs.parcel
-qmllint -I "$OMARCHY_PATH/shell" ~/.config/omarchy/plugins/io.github.zuccs.parcel/*.qml
+omarchy plugin validate .
+qmllint -I "$OMARCHY_PATH/shell" *.qml   # note: qmllint 1.0 rejects `function x(): void`, as it does on first-party Weather
 node --test test/*.test.js           # Model.js is plain JS and unit-tested
 PARCEL_API_KEY=… bin/parcel-api deliveries active --max-age 0 | jq   # bridge without a keyring
 ```
