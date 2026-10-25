@@ -77,6 +77,33 @@ Bind a key in `~/.config/hypr/bindings.lua`:
 o.bind("SUPER + CTRL + SHIFT + P", "Parcel", "omarchy-shell shell toggle riclib.parcel")
 ```
 
+## Command line
+
+`bin/parcel` is the same data from a terminal, for you or for an agent that
+reads your mail: a readable list by default, one JSON object with `--json`.
+
+```bash
+ln -s ~/.config/omarchy/plugins/riclib.parcel/bin/parcel ~/.local/bin/parcel
+
+parcel list [--recent] [--fresh] [--json]   # most urgent first
+parcel show <tracking|text> [--json]        # one delivery's event timeline
+parcel carriers dhl                         # carrier codes by name
+parcel add <tracking> <carrier> "<description>" [--email E] [--postcode P] [--language xx] [--no-push]
+```
+
+Reads go through `bin/parcel-api` with a 5-minute cache, so the CLI and the
+widget share one cache and Parcel's 20 requests/hour; `--fresh` skips the
+cache. `add` calls the API itself, because it can send the email, postcode
+and language some carriers need, and it refuses an unknown carrier code (or a
+carrier that needs an email or postcode it was not given) before spending one
+of the 20 adds a day, which failed adds also use up.
+
+It uses the same keyring entry as the widget. If you would rather keep the key
+in a file, put `PARCEL_API_KEY=...` in `~/.config/secrets/parcel.env` (or point
+`PARCEL_ENV_FILE` elsewhere): the file then wins, and each run copies it into
+the keyring when they differ, so the widget follows. `parcel sync-key` does
+only that.
+
 ## Uninstall
 
 ```bash
@@ -134,7 +161,9 @@ like every Omarchy bar widget. The defaults:
 - Your API key lives in the login keyring (libsecret). It is never written to
   `shell.json`, the QML never reads it, and `bin/parcel-api` hands it to `curl`
   as a config on stdin (`-K -`) rather than as an argument, so it doesn't show
-  up in the process list either.
+  up in the process list either. `bin/parcel` does the same for `add`, and
+  strips control characters from every remote string before printing it, so
+  a delivery description cannot drive your terminal.
 - Everything the API returns is treated as untrusted — it is relayed from
   carrier systems, not written by Parcel. Response bodies are capped at 1 MiB
   before anything parses them, delivery and event lists are capped before they
@@ -177,7 +206,8 @@ manifest.json     plugin identity, settings schema and defaults
 BarWidget.qml     bar entry point: badge + Loader for the panel
 Panel.qml         popup: fetch lifecycle, notifications, keyboard list
 Model.js          pure functions (parsing, sorting, ETA/relative time, diffs)
-bin/parcel-api    the only code that touches the network or the API key
+bin/parcel-api    the widget's bridge to the network and the API key
+bin/parcel        the command-line client; reads through parcel-api, adds on its own
 data/carriers.json  bundled carrier code → name snapshot; `bin/parcel-api carriers --refresh`
                   caches a newer list in ~/.local/state/omarchy/parcel/, which the widget
                   prefers on its next shell start

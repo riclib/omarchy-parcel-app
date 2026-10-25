@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+#
+# parcel — the Parcel app (parcelapp.net) from a terminal, for people and agents.
+#
+# Usage:
+#   parcel list [--recent] [--fresh] [--json]     deliveries, most urgent first
+#   parcel show <tracking|text> [--fresh] [--json]  one delivery and its events
+#   parcel add <tracking> <carrier> <description>
+#              [--email E] [--postcode P] [--language xx] [--no-push] [--json]
+#   parcel carriers [search] [--refresh] [--json] carrier codes, e.g. "dhl"
+#   parcel sync-key                               copy the key file into the keyring
+#
+# Reads go through the bar widget's own bridge, bin/parcel-api beside this
+# script, so the widget and this CLI share one cache and one budget of 20
+# requests/hour. A list is served from that
+# cache when it is under 5 minutes old; --fresh asks Parcel again. Parcel's
+# server refreshes from the carriers on its own schedule either way.
+#
+# add talks to the API directly, because the bridge cannot pass an email,
+# postcode or language. Parcel allows 20 adds per day and failed ones count,
+# so the carrier code is checked against the carrier list before sending.
+#
+# The key: the widget reads only the login keyring (service omarchy-parcel,
+# key api-key), and a key stored there with secret-tool is all this CLI needs
+# too. If you would rather keep it in a file, put PARCEL_API_KEY=... in
+# ~/.config/secrets/parcel.env (or $PARCEL_ENV_FILE); the file then wins, and
+# every run copies it into the keyring if the two differ.
+#
+# Symlink this script onto PATH (ln -s .../riclib.parcel/bin/parcel
+# ~/.local/bin/parcel) so it updates with the plugin.
+#
+# --json prints exactly one JSON object; failures are {"ok":false,...}.
+# Exit status: 0 ok, 1 API/network failure, 64 usage error.
+
+set -euo pipefail
+
+readonly ENV_FILE="${PARCEL_ENV_FILE:-$HOME/.config/secrets/parcel.env}"
+readonly BRIDGE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/parcel-api"
+readonly API="https://api.parcel.app/external"
+readonly CACHE_SEC=300
+
+usage() {
+  sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+}
+
+JSON=false
+die() { # <code> <message> — reported in the requested format, exit 1
+  if $JSON; then
+    jq -cn --arg c "$1" --arg m "$2" '{ok:false, error:$c, message:$m}'
+  else
+    echo "parcel: $2" >&2
+  fi
+  exit 1
+}
+
+# ---- Key ---------------------------------------------------------------------
+
+file_key() {
+  [[ -r "$ENV_FILE" ]] || return 0
+  sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\{0,1\}PARCEL_API_KEY=//p' "$ENV_FILE" \
+    | tail -n1 | sed "s/^[\"']//; s/[\"'][[:space:]]*\$//; s/[[:space:]]*\$//"
+}
+
+keyring_key() {
+  command -v secret-tool >/dev/null 2>&1 || return 0
+  secret-tool lookup service omarchy-parcel key api-key 2>/dev/null || true
+}
+
+KEY=""
+load_key() {
+  KEY="$(file_key)"
+  if [[ -n "$KEY" ]]; then
+    [[ "$KEY" != *[![:print:]]* ]] || die bad-key "The key in $ENV_FILE contains control characters."
+    sync_key
+    return
+  fi
+  KEY="$(keyring_key)"
+  [[ -n "$KEY" ]] || die no-key "No Parcel API key. Generate one at web.parcelapp.net (Settings → API), then either run: secret-tool store --label='Parcel API key' service omarchy-parcel key api-key — or put PARCEL_API_KEY= in $ENV_FILE."
+  [[ "$KEY" != *[![:print:]]* ]] || die bad-key "The key in the keyring contains control characters."
+  KEYRING_OK=true
+}
+
+# The keyring may be locked or absent (an ssh session); then the widget just
+# keeps whatever it had, and this run hands the key to the bridge directly.
+KEYRING_OK=false
+sync_key() {
+  command -v secret-tool >/dev/null 2>&1 || return 0
+  local stored
+  stored="$(keyring_key)"
+  if [[ "$stored" == "$KEY" ]]; then
+    KEYRING_OK=true
+  elif printf '%s' "$KEY" | secret-tool store --label='Parcel API key' service omarchy-parcel key api-key 2>/dev/null; then
+    KEYRING_OK=true
+    echo "parcel: copied the key from $ENV_FILE into the keyring" >&2
+  fi
+}
+
+# ---- Bridge ------------------------------------------------------------------
+
+bridge() {
+  [[ -x "$BRIDGE" ]] || die no-bridge "$BRIDGE is missing; this script belongs in the plugin's bin/."
+  if $KEYRING_OK; then
+    "$BRIDGE" "$@"
+  else
+    PARCEL_API_KEY="$KEY" "$BRIDGE" "$@"
+  fi
+}
+
+CARRIERS="{}"
+load_carriers() { # [--refresh]
+  local out
+  out="$(bridge carriers "$@")"
+  [[ "$(jq -r .ok <<<"$out")" == true ]] && CARRIERS="$(jq -c .carriers <<<"$out")"
+  return 0
+}
+
+DELIVERIES=""
+fetch() { # <active|recent> <max-age>
+  load_key
+  DELIVERIES="$(bridge deliveries "$1" --max-age "$2")"
+  [[ "$(jq -r .ok <<<"$DELIVERIES")" == true ]] \
+    || die "$(jq -r '.error // "failed"' <<<"$DELIVERIES")" "$(jq -r '.message // "Parcel request failed."' <<<"$DELIVERIES")"
+  # A 429 or an outage still answers ok, from the last good cache.
+  if [[ "$(jq -r '.stale // false' <<<"$DELIVERIES")" == true ]] && ! $JSON; then
+    echo "parcel: $(jq -r .message <<<"$DELIVERIES") (data from $(date -d "@$(jq -r .fetchedAt <<<"$DELIVERIES")" '+%a %H:%M'))" >&2
+  fi
+  load_carriers
+}
+
+# Shapes the bridge's response into what both output modes print. Remote
+# strings come from carrier systems: control characters are flattened so a
+# description cannot drive the terminal.
+readonly SHAPE='
+  def clean: tostring | gsub("[\u0000-\u001f\u007f-\u009f]+"; " ") | gsub("^ +| +$"; "") | .[0:200];
+  def status_label: {"0":"Delivered","1":"Frozen","2":"In transit","3":"Ready for pickup",
+              "4":"Out for delivery","5":"Not found","6":"Failed attempt",
+              "7":"Exception","8":"Label created"}[tostring] // "Unknown";
+  def status_rank: {"4":0,"6":1,"7":2,"3":3,"2":4,"8":5,"5":6,"1":7,"0":8}[tostring] // 9;
+  [.deliveries[] | {
+     tracking_number: (.tracking_number | clean),
+     description: (.description // "" | clean),
+     carrier_code: (.carrier_code | clean),
+     carrier: ($carriers[.carrier_code].name // .carrier_code | clean),
+     status_code, status: (.status_code | status_label), rank: (.status_code | status_rank),
+     expected: (.date_expected // null | if . then clean else . end),
+     expected_end: (.date_expected_end // null | if . then clean else . end),
+     timestamp_expected: (.timestamp_expected // null),
+     extra_information: (.extra_information // null | if . then clean else . end),
+     events: [(.events // [])[] | {event: (.event | clean), date: (.date | clean),
+              location: (.location // null | if . then clean else . end),
+              additional: (.additional // null | if . then clean else . end)}]
+   }] | sort_by(.rank, .timestamp_expected // 9e12) | map(del(.rank))'
+
+shaped() {
+  jq -c --argjson carriers "$CARRIERS" "$SHAPE" <<<"$DELIVERIES"
+}
+
+# ---- Formatting --------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[0m' URG=$'\e[33m' OK=$'\e[32m'
+else
+  B="" D="" R="" URG="" OK=""
+fi
+
+tone() { # <status_code> → colour
+  case "$1" in 4|6|7) printf '%s' "$URG" ;; 0) printf '%s' "$OK" ;; 1|5) printf '%s' "$D" ;; esac
+}
+
+# "2026-10-27 13:00:00" → "Tue 27 Oct 13:00 (in 2 days)"; anything unparseable as is.
+when() { # <date-string>
+  local s="$1" epoch days
+  [[ -n "$s" && "$s" != null ]] || return 0
+  if epoch="$(date -d "$s" +%s 2>/dev/null)"; then
+    days=$(( ( $(date -d "$(date -d "@$epoch" +%F)" +%s) - $(date -d "$(date +%F)" +%s) ) / 86400 ))
+    local fmt='%a %-d %b'
+    [[ "$s" == *[0-9]:[0-9][0-9]* && "$s" != *" 00:00:00" ]] && fmt+=' %H:%M'
+    case "$days" in
+      0) printf 'today%s' "$(date -d "@$epoch" "+${fmt#%a %-d %b}")" ;;
+      1) printf 'tomorrow%s' "$(date -d "@$epoch" "+${fmt#%a %-d %b}")" ;;
+      -*) printf '%s' "$(date -d "@$epoch" "+$fmt")" ;;
+      *) printf '%s (in %d days)' "$(date -d "@$epoch" "+$fmt")" "$days" ;;
+    esac
+  else
+    printf '%s' "$s"
+  fi
+}
+
+print_list() { # <shaped-json>
+  local n
+  n="$(jq length <<<"$1")"
+  if (( n == 0 )); then
+    echo "Nothing on the way."
+    return
+  fi
+  local code status desc carrier tracking expected latest
+  while IFS=$'\x1f' read -r code status desc carrier tracking expected latest; do
+    printf '%s%-17s%s %s%s%s\n' "$(tone "$code")" "$status" "$R" "$B" "$desc" "$R"
+    printf '                  %s%s · %s%s\n' "$D" "$carrier" "$tracking" "$R"
+    [[ -n "$latest" ]] && printf '                  %s\n' "$latest"
+    [[ -n "$expected" ]] && printf '                  expected %s\n' "$(when "$expected")"
+  done < <(jq -r '.[] | [.status_code, .status, (.description | if . == "" then "(no description)" else . end),
+                         .carrier, .tracking_number, (.expected // ""),
+                         (.events[0] // {} | [.event, .location] | map(select(. != null and . != "")) | join(" — "))]
+                       | map(tostring) | join("\u001f")' <<<"$1")
+  printf '%s%d deliveries · %s%s\n' "$D" "$n" "$(fetched_note)" "$R"
+}
+
+fetched_note() {
+  local at age
+  at="$(jq -r .fetchedAt <<<"$DELIVERIES")"
+  age=$(( $(date +%s) - at ))
+  if (( age < 60 )); then echo "fetched just now"; else echo "fetched $(( age / 60 )) min ago"; fi
+}
+
+print_one() { # <delivery-json>
+  local d="$1" code
+  code="$(jq -r .status_code <<<"$d")"
+  printf '%s%s%s\n' "$B" "$(jq -r '.description | if . == "" then "(no description)" else . end' <<<"$d")" "$R"
+  printf '%s · %s\n' "$(jq -r .tracking_number <<<"$d")" "$(jq -r .carrier <<<"$d")"
+  printf '%s%s%s' "$(tone "$code")" "$(jq -r .status <<<"$d")" "$R"
+  local exp
+  exp="$(jq -r '.expected // empty' <<<"$d")"
+  [[ -n "$exp" ]] && printf ' · expected %s' "$(when "$exp")"
+  printf '\n\n'
+  local date event location additional
+  while IFS=$'\x1f' read -r date event location additional; do
+    printf '%s%s%s  %s\n' "$D" "$date" "$R" "$event"
+    [[ -n "$location" ]] && printf '%*s  %s%s%s\n' "${#date}" "" "$D" "$location" "$R"
+    [[ -n "$additional" ]] && printf '%*s  %s\n' "${#date}" "" "$additional"
+  done < <(jq -r '.events[] | [.date, .event, (.location // ""), (.additional // "")] | join("\u001f")' <<<"$d")
+  [[ "$(jq '.events | length' <<<"$d")" == 0 ]] && echo "No tracking events yet."
+  return 0
+}
+
+# ---- Commands ----------------------------------------------------------------
+
+cmd_list() {
+  local mode=active age=$CACHE_SEC
+  while (($#)); do
+    case "$1" in
+      --recent) mode=recent ;;
+      --fresh) age=0 ;;
+      --json) ;;
+      *) usage ;;
+    esac
+    shift
+  done
+  fetch "$mode" "$age"
+  local list
+  list="$(shaped)"
+  if $JSON; then
+    jq -c --argjson list "$list" '{ok:true, mode, fetchedAt, cached, stale, deliveries:$list}' <<<"$DELIVERIES"
+  else
+    print_list "$list"
+  fi
+}
+
+# A tracking number matches exactly; anything else matches a description or
+# tracking number by case-insensitive substring. "recent" is searched too, so
+# a parcel delivered yesterday can still be found.
+cmd_show() {
+  local query="" age=$CACHE_SEC
+  while (($#)); do
+    case "$1" in
+      --fresh) age=0 ;;
+      --json) ;;
+      -*) usage ;;
+      *) [[ -z "$query" ]] || usage; query="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$query" ]] || usage
+  fetch recent "$age"
+  local matches n
+  matches="$(shaped | jq -c --arg q "$query" '
+    (map(select(.tracking_number == $q))) as $exact
+    | if ($exact | length) > 0 then $exact
+      else map(select((.description + " " + .tracking_number) | ascii_downcase | contains($q | ascii_downcase)))
+      end')"
+  n="$(jq length <<<"$matches")"
+  if (( n == 0 )); then
+    die not-found "No recent delivery matches \"$query\"."
+  elif (( n > 1 )); then
+    if $JSON; then
+      jq -c '{ok:false, error:"ambiguous", message:"Several deliveries match.",
+              matches: map({tracking_number, description, carrier, status})}' <<<"$matches"
+      exit 1
+    fi
+    echo "parcel: \"$query\" matches $n deliveries:" >&2
+    jq -r '.[] | "  \(.tracking_number)  \(.description)  (\(.status))"' <<<"$matches" >&2
+    exit 1
+  fi
+  if $JSON; then
+    jq -c '{ok:true, delivery:.[0]}' <<<"$matches"
+  else
+    print_one "$(jq -c '.[0]' <<<"$matches")"
+  fi
+}
+
+cmd_carriers() {
+  local query="" refresh=()
+  while (($#)); do
+    case "$1" in
+      --refresh) refresh=(--refresh) ;;
+      --json) ;;
+      -*) usage ;;
+      *) query="${query:+$query }$1" ;;
+    esac
+    shift
+  done
+  load_carriers "${refresh[@]}"
+  local found
+  found="$(jq -c --arg q "$query" '
+    to_entries
+    | map({code:.key, name:.value.name, needs_extra:((.value.extra_required // 0) == 1)})
+    | map(select($q == "" or ((.code + " " + .name) | ascii_downcase | contains($q | ascii_downcase))))
+    | sort_by(.name)' <<<"$CARRIERS")"
+  if $JSON; then
+    jq -c '{ok:true, carriers:.}' <<<"$found"
+  elif [[ "$(jq length <<<"$found")" == 0 ]]; then
+    echo "No carrier matches \"$query\"." >&2
+    exit 1
+  else
+    jq -r '.[] | [.code, .name + (if .needs_extra then "  (needs --email or --postcode)" else "" end)] | @tsv' <<<"$found" \
+      | column -t -s $'\t'
+  fi
+}
+
+cmd_add() {
+  local -a pos=()
+  local email="" postcode="" language="" push=true
+  while (($#)); do
+    case "$1" in
+      --email) shift; email="${1:-}" ;;
+      --postcode) shift; postcode="${1:-}" ;;
+      --language) shift; language="${1:-}" ;;
+      --no-push) push=false ;;
+      --json) ;;
+      -*) usage ;;
+      *) pos+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#pos[@]} == 3 )) || usage
+  local tracking="${pos[0]}" carrier="${pos[1]}" description="${pos[2]}"
+  [[ -n "$tracking" && -n "$description" ]] || usage
+  [[ -z "$language" || "$language" =~ ^[a-z]{2}$ ]] || die usage "--language takes a two-letter code such as en or pt."
+
+  load_key
+  load_carriers
+  # Every failed add spends one of the day's 20, so refuse what Parcel would.
+  if [[ "$carrier" != pholder ]]; then
+    [[ "$(jq -r --arg c "$carrier" 'has($c)' <<<"$CARRIERS")" == true ]] \
+      || die unknown-carrier "\"$carrier\" is not a Parcel carrier code. Find it with: parcel carriers <name>"
+    if [[ "$(jq -r --arg c "$carrier" '.[$c].extra_required // 0' <<<"$CARRIERS")" == 1 && -z "$email$postcode" ]]; then
+      die needs-extra "$(jq -r --arg c "$carrier" '.[$c].name' <<<"$CARRIERS") needs --email or --postcode to track."
+    fi
+  fi
+
+  local payload
+  payload="$(jq -cn --arg t "$tracking" --arg c "$carrier" --arg d "$description" \
+    --arg e "$email" --arg p "$postcode" --arg l "$language" --argjson push "$push" '
+    {tracking_number:$t, carrier_code:$c, description:$d, send_push_confirmation:$push}
+    + (if $e != "" then {email:$e} else {} end)
+    + (if $p != "" then {postcode:$p} else {} end)
+    + (if $l != "" then {language:$l} else {} end)')"
+
+  # The key reaches curl as a config on stdin, never in argv.
+  local esc="${KEY//\\/\\\\}" body code
+  esc="${esc//\"/\\\"}"
+  body="$(printf 'header = "api-key: %s"\n' "$esc" \
+    | curl -s -K - --proto '=https' --max-time 20 --max-filesize 65536 \
+        -H 'Content-Type: application/json' -H 'Accept: application/json' \
+        -w '\n%{http_code}' --data "$payload" "$API/add-delivery/")" \
+    || die network "Could not reach api.parcel.app."
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  case "$code" in
+    200) ;;
+    401|403) die auth "Parcel rejected the API key (HTTP $code)." ;;
+    429) die rate-limited "Parcel's add limit is reached (20 per day)." ;;
+  esac
+  if [[ "$(jq -r '.success // false' <<<"$body" 2>/dev/null)" != true ]]; then
+    die api "$(jq -r '(.error_message // "Parcel did not add the delivery.") | tostring | .[0:200]' <<<"$body" 2>/dev/null || echo "Parcel returned HTTP $code.")"
+  fi
+  if $JSON; then
+    jq -c '{ok:true, added:(. | del(.send_push_confirmation))}' <<<"$payload"
+  else
+    echo "Added \"$description\" ($tracking, $(jq -r --arg c "$carrier" '.[$c].name // $c' <<<"$CARRIERS")). Tracking data shows up after Parcel's next update."
+  fi
+}
+
+cmd_sync_key() {
+  [[ -n "$(file_key)" ]] || die no-key "Nothing to sync: no PARCEL_API_KEY= in $ENV_FILE."
+  load_key
+  if $KEYRING_OK; then
+    echo "Keyring matches $ENV_FILE."
+  else
+    die keyring "Could not write the keyring (is the login keyring unlocked?)."
+  fi
+}
+
+(($#)) || usage
+for a in "$@"; do [[ "$a" == --json ]] && JSON=true; done
+command -v jq >/dev/null || { echo "parcel: jq is required" >&2; exit 1; }
+cmd="$1"; shift
+case "$cmd" in
+  list|ls) cmd_list "$@" ;;
+  show) cmd_show "$@" ;;
+  add) cmd_add "$@" ;;
+  carriers) cmd_carriers "$@" ;;
+  sync-key) cmd_sync_key "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage ;;
+esac
