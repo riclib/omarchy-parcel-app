@@ -10,8 +10,8 @@ import "Model.js" as Model
 // list of deliveries. All network access goes through bin/parcel-api.
 Panel {
   id: root
-  moduleName: "io.github.zuccs.parcel"
-  ipcTarget: "io.github.zuccs.parcel"
+  moduleName: "riclib.parcel"
+  ipcTarget: "riclib.parcel"
   manageIpc: false
 
   property var anchorItem: null

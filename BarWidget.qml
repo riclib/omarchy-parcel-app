@@ -9,7 +9,7 @@ import qs.Ui
 // the bar's single-popout coordinator treat this widget as the panel.
 BarWidget {
   id: root
-  moduleName: "io.github.zuccs.parcel"
+  moduleName: "riclib.parcel"
 
   readonly property var panel: panelLoader.item
   readonly property int activeCount: panel ? panel.activeCount : 0

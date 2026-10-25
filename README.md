@@ -1,5 +1,12 @@
 # Parcel for Omarchy
 
+> **Fork.** This is Ricardo Liberato's fork of
+> [zuccs/omarchy-parcel-app](https://github.com/zuccs/omarchy-parcel-app), under
+> its own plugin id `riclib.parcel`. It carries the panel-dismissal fix from
+> upstream PR #2: on Omarchy 4.0.x `bar.centerHoverRevealSuppressed` is
+> read-only, so upstream's `close()` threw before hiding and the panel could
+> never be closed (upstream issue #1).
+
 Your [Parcel](https://parcelapp.net) deliveries in the Omarchy bar.
 
 ![Parcel panel showing three deliveries with an expanded checkpoint timeline](preview.png)
@@ -23,7 +30,7 @@ there through Parcel's Premium API, so your desktop and your phone agree.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/zuccs/omarchy-parcel-app.git --enable
+omarchy plugin add https://github.com/riclib/omarchy-parcel-app.git --enable
 ```
 
 The widget lands in the right section of the bar. Move it with `omarchy bar move`.
@@ -45,8 +52,8 @@ The widget lands in the right section of the bar. Move it with `omarchy bar move
 Verify from a terminal any time:
 
 ```bash
-~/.config/omarchy/plugins/io.github.zuccs.parcel/bin/parcel-api status
-~/.config/omarchy/plugins/io.github.zuccs.parcel/bin/parcel-api deliveries active | jq
+~/.config/omarchy/plugins/riclib.parcel/bin/parcel-api status
+~/.config/omarchy/plugins/riclib.parcel/bin/parcel-api deliveries active | jq
 ```
 
 ## Using it
@@ -67,13 +74,13 @@ Verify from a terminal any time:
 Bind a key in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + CTRL + SHIFT + P", "Parcel", "omarchy-shell shell toggle io.github.zuccs.parcel")
+o.bind("SUPER + CTRL + SHIFT + P", "Parcel", "omarchy-shell shell toggle riclib.parcel")
 ```
 
 ## Uninstall
 
 ```bash
-omarchy plugin remove io.github.zuccs.parcel
+omarchy plugin remove riclib.parcel
 ```
 
 That removes the plugin directory and its `shell.json` entry. Two things are
@@ -92,7 +99,7 @@ Settings live inline on the widget's entry in `~/.config/omarchy/shell.json`,
 like every Omarchy bar widget. The defaults:
 
 ```json
-{ "id": "io.github.zuccs.parcel", "refreshIntervalSec": 600, "filterMode": "active", "notifications": "On", "hideWhenEmpty": "Off" }
+{ "id": "riclib.parcel", "refreshIntervalSec": 600, "filterMode": "active", "notifications": "On", "hideWhenEmpty": "Off" }
 ```
 
 | Key | Values | Meaning |
@@ -149,8 +156,8 @@ like every Omarchy bar widget. The defaults:
 
 ```bash
 # Install the normal way — the result is a plain git checkout you can edit in place.
-omarchy plugin add https://github.com/zuccs/omarchy-parcel-app.git --enable
-cd ~/.config/omarchy/plugins/io.github.zuccs.parcel
+omarchy plugin add https://github.com/riclib/omarchy-parcel-app.git --enable
+cd ~/.config/omarchy/plugins/riclib.parcel
 
 omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" *.qml   # note: qmllint 1.0 rejects `function x(): void`, as it does on first-party Weather

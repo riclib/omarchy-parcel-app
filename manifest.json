@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.zuccs.parcel",
+  "id": "riclib.parcel",
   "name": "Parcel",
-  "version": "0.1.1",
-  "author": "Daniel Zuccon",
+  "version": "0.2.0",
+  "author": "Ricardo Liberato (fork of Daniel Zuccon's io.github.zuccs.parcel)",
   "license": "MIT",
   "description": "Your Parcel app deliveries in the Omarchy bar: a status-tinted badge, active shipments with ETAs, event timelines, and desktop notifications when a parcel moves.",
   "kinds": ["bar-widget"],
