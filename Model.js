@@ -359,6 +359,90 @@ function notificationFor(change) {
 
 var SETUP_COMMAND = "secret-tool store --label='Parcel API key' service omarchy-parcel key api-key"
 
+// ---- Adding a delivery ----------------------------------------------------
+//
+// The panel's add form hands bin/parcel an argv, never a shell string, so
+// nothing typed into it is ever interpreted. These helpers are pure so the
+// node tests can cover them.
+
+// Codes of carriers Parcel marks extra_required: they track only with the
+// account email or the destination postcode.
+function parseCarrierExtras(raw) {
+  try {
+    var data = typeof raw === "string" ? JSON.parse(raw) : raw
+    if (!data || typeof data !== "object" || data.ok === false) return {}
+    if (data.ok === true || data.carriers !== undefined) data = data.carriers
+    var out = {}
+    for (var code in data) {
+      var entry = data[code]
+      if (entry && typeof entry === "object" && Number(entry.extra_required) === 1) out[trim(code, MAX_CODE)] = true
+    }
+    return out
+  } catch (e) {
+    return {}
+  }
+}
+
+// Best matches first: exact code, then a name or code that starts with the
+// query, then a word in the name that does, then anywhere. Every word of a
+// multi-word query must match ("dhl uk", "amazon spain").
+function matchCarriers(query, carriers, limit) {
+  var q = trim(query).toLowerCase()
+  var max = limit || 6
+  if (!q) return []
+  var words = q.split(/\s+/)
+  var scored = []
+  for (var code in carriers) {
+    var name = String(carriers[code])
+    var hay = (code + " " + name).toLowerCase()
+    var all = true
+    for (var i = 0; i < words.length; i++) if (hay.indexOf(words[i]) < 0) { all = false; break }
+    if (!all) continue
+    var lname = name.toLowerCase(), lcode = code.toLowerCase(), score
+    if (lcode === q) score = 0
+    else if (lname.indexOf(q) === 0 || lcode.indexOf(q) === 0) score = 1
+    else if ((" " + lname).indexOf(" " + words[0]) >= 0) score = 2
+    else score = 3
+    scored.push({ code: code, name: name, score: score })
+  }
+  scored.sort(function(a, b) { return a.score - b.score || a.name.localeCompare(b.name) })
+  return scored.slice(0, max).map(function(c) { return { code: c.code, name: c.name } })
+}
+
+// Tracking numbers are printed with spaces and dashes for reading; Parcel
+// wants the bare number.
+function cleanTracking(text) {
+  return trim(text, MAX_TRACKING).replace(/[\s-]+/g, "")
+}
+
+// {tracking, carrier, description, extra} → {ok, argv} or {ok:false, message}.
+// extra is one field the user fills in: an email if it has an @, else a postcode.
+function addArgs(form, extras) {
+  var tracking = cleanTracking(form.tracking || "")
+  var carrier = trim(form.carrier || "", MAX_CODE)
+  var description = trim(form.description || "")
+  var extra = trim(form.extra || "")
+  if (!tracking) return { ok: false, message: "Enter a tracking number." }
+  if (!carrier) return { ok: false, message: "Pick a carrier." }
+  if (!description) return { ok: false, message: "Enter a description." }
+  if (extras && extras[carrier] && !extra) return { ok: false, message: "This carrier needs the order email or the destination postcode." }
+  var argv = ["add", tracking, carrier, description]
+  if (extra) argv.push(extra.indexOf("@") > 0 ? "--email" : "--postcode", extra)
+  argv.push("--json")
+  return { ok: true, argv: argv }
+}
+
+// bin/parcel add --json prints one object; anything else is a failure.
+function parseAddResult(raw) {
+  try {
+    var data = JSON.parse(String(raw || "").trim())
+    if (data && data.ok === true) return { ok: true }
+    return { ok: false, message: trim((data && data.message) || "Parcel did not add the delivery.") }
+  } catch (e) {
+    return { ok: false, message: "parcel add produced no result." }
+  }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     STATUS: STATUS,
@@ -385,6 +469,11 @@ if (typeof module !== "undefined") {
     formatRelative: formatRelative,
     formatEventTime: formatEventTime,
     diffStatuses: diffStatuses,
-    notificationFor: notificationFor
+    notificationFor: notificationFor,
+    parseCarrierExtras: parseCarrierExtras,
+    matchCarriers: matchCarriers,
+    cleanTracking: cleanTracking,
+    addArgs: addArgs,
+    parseAddResult: parseAddResult
   }
 }

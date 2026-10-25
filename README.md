@@ -65,6 +65,7 @@ Verify from a terminal any time:
 | Badge — right click | Open web.parcelapp.net |
 | Panel — `↑` `↓` / `j` `k` | Move between deliveries |
 | Panel — `Enter` / `Space` / click | Expand the checkpoint timeline |
+| Panel — `a` or the `+` button | Add a delivery: tracking number, carrier (type to search, `↑` `↓` + `Enter` to pick), description, and the email or postcode when the carrier needs one. `Enter` moves on, `Esc` cancels |
 | Panel — `y` or `c` | Copy the tracking number |
 | Panel — `r` | Refresh now |
 | Panel — `o` | Open web.parcelapp.net |
@@ -76,6 +77,15 @@ Bind a key in `~/.config/hypr/bindings.lua`:
 ```lua
 o.bind("SUPER + CTRL + SHIFT + P", "Parcel", "omarchy-shell shell toggle riclib.parcel")
 ```
+
+## Adding a delivery
+
+Press `a` in the panel, or click `+`. The form hands `bin/parcel add` an
+argument list (never a shell string), so nothing typed into it is
+interpreted. `bin/parcel` checks the carrier code first, because Parcel allows
+20 adds a day and a failed one still counts. A new delivery shows *No data
+available* until Parcel's server next updates it; the panel refreshes once
+after a successful add.
 
 ## Command line
 
@@ -216,8 +226,6 @@ test/             node:test suite for Model.js
 
 ## Roadmap
 
-- Add a delivery from the panel: paste a tracking number, pick the carrier, done
-  (`bin/parcel-api add` already exists — Parcel allows 20 adds/day).
 - Optional Parcel-style route map for the expanded row.
 
 ## License

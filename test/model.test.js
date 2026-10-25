@@ -190,3 +190,40 @@ test("control characters go, ordinary text is left alone", () => {
   assert.equal(Model.trim("Café — 3 items"), "Café — 3 items")
   assert.equal(Model.trim("bell\u0007 and null\u0000 "), "bell and null")
 })
+
+const ALL_CARRIERS = { dhl: "DHL Express", dhluk: "DHL Parcel UK", dhlnl: "DHL Netherlands", amzles: "Amazon Spain",
+  amzlde: "Amazon Germany", ups: "UPS", posti: "Posti Finland - Itella", allied: "Allied Express" }
+
+test("matchCarriers ranks exact code, then prefix, and needs every word", () => {
+  assert.deepEqual(Model.matchCarriers("dhl", ALL_CARRIERS).map(c => c.code), ["dhl", "dhlnl", "dhluk"])
+  assert.deepEqual(Model.matchCarriers("dhl uk", ALL_CARRIERS).map(c => c.code), ["dhluk"])
+  assert.deepEqual(Model.matchCarriers("amazon spain", ALL_CARRIERS).map(c => c.code), ["amzles"])
+  assert.deepEqual(Model.matchCarriers("finland", ALL_CARRIERS).map(c => c.code), ["posti"])
+  assert.deepEqual(Model.matchCarriers("", ALL_CARRIERS), [])
+  assert.equal(Model.matchCarriers("a", ALL_CARRIERS, 3).length, 3)
+})
+
+test("parseCarrierExtras keeps only extra_required carriers", () => {
+  const raw = JSON.stringify({ ok: true, carriers: { allied: { name: "Allied Express", extra_required: 1 }, ups: { name: "UPS" } } })
+  assert.deepEqual(Model.parseCarrierExtras(raw), { allied: true })
+  assert.deepEqual(Model.parseCarrierExtras("junk"), {})
+})
+
+test("addArgs builds an argv, never a shell string, and validates first", () => {
+  const ok = Model.addArgs({ tracking: " 1Z 999-AA1 ", carrier: "ups", description: "Shoes; rm -rf ~" }, {})
+  assert.deepEqual(ok.argv, ["add", "1Z999AA1", "ups", "Shoes; rm -rf ~", "--json"])
+  assert.deepEqual(Model.addArgs({ tracking: "A1", carrier: "allied", description: "Hub", extra: "me@x.io" }, { allied: true }).argv,
+    ["add", "A1", "allied", "Hub", "--email", "me@x.io", "--json"])
+  assert.deepEqual(Model.addArgs({ tracking: "A1", carrier: "allied", description: "Hub", extra: "1000-001" }, { allied: true }).argv.slice(4, 6),
+    ["--postcode", "1000-001"])
+  assert.equal(Model.addArgs({ tracking: "A1", carrier: "allied", description: "Hub" }, { allied: true }).ok, false)
+  assert.equal(Model.addArgs({ tracking: "", carrier: "ups", description: "x" }, {}).ok, false)
+  assert.equal(Model.addArgs({ tracking: "A1", carrier: "", description: "x" }, {}).ok, false)
+  assert.equal(Model.addArgs({ tracking: "A1", carrier: "ups", description: "  " }, {}).ok, false)
+})
+
+test("parseAddResult reads bin/parcel's one JSON object", () => {
+  assert.deepEqual(Model.parseAddResult('{"ok":true,"added":{}}'), { ok: true })
+  assert.deepEqual(Model.parseAddResult('{"ok":false,"error":"rate-limited","message":"Limit reached"}'), { ok: false, message: "Limit reached" })
+  assert.equal(Model.parseAddResult("").ok, false)
+})

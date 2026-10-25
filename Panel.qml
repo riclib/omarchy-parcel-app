@@ -40,6 +40,7 @@ Panel {
   }
 
   function close() {
+    if (root.adding) root.cancelAdd()
     try {
       setCenterHoverRevealSuppressed(false)
     } finally {
@@ -79,8 +80,11 @@ Panel {
 
   // Absolute path of the bridge script, wherever this plugin was installed.
   readonly property string scriptPath: String(Qt.resolvedUrl("bin/parcel-api")).replace(/^file:\/\//, "")
+  // The command-line client beside it, which owns adding a delivery.
+  readonly property string cliPath: String(Qt.resolvedUrl("bin/parcel")).replace(/^file:\/\//, "")
 
   property var carriers: ({})
+  property var carrierExtras: ({})
   property string lastRaw: ""
   property var deliveries: []
   property string errorCode: ""
@@ -248,6 +252,103 @@ Panel {
   }
   property string _fetchOutput: ""
 
+  // ---- Adding a delivery ----------------------------------------------------
+  //
+  // An inline form (a, or the + button) that hands bin/parcel an argv. While
+  // it is open the key catcher is blocked so typing reaches the fields, the
+  // way Weather's location editor works. Parcel allows 20 adds a day and a
+  // failed one counts, so bin/parcel checks the carrier before spending one.
+
+  property bool adding: false
+  property bool addBusy: false
+  property string addMessage: ""
+  property var carrierMatches: []
+  property int carrierIndex: 0
+  property string carrierCode: ""
+  property string carrierPickedName: ""
+  readonly property bool carrierNeedsExtra: carrierCode !== "" && root.carrierExtras[carrierCode] === true
+
+  function startAdd() {
+    if (root.needsSetup || root.adding) return
+    trackingField.text = ""
+    carrierField.text = ""
+    descriptionField.text = ""
+    extraField.text = ""
+    root.carrierCode = ""
+    root.carrierPickedName = ""
+    root.carrierMatches = []
+    root.addMessage = ""
+    root.adding = true
+    Qt.callLater(function() { trackingField.forceActiveFocus() })
+  }
+
+  function cancelAdd() {
+    root.adding = false
+    root.addBusy = false
+    root.addMessage = ""
+    Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
+  }
+
+  function carrierTyped() {
+    if (carrierField.text === root.carrierPickedName && root.carrierCode !== "") return
+    root.carrierCode = ""
+    root.carrierPickedName = ""
+    root.carrierMatches = Model.matchCarriers(carrierField.text, root.carriers, 6)
+    root.carrierIndex = 0
+  }
+
+  function pickCarrier(i) {
+    var c = root.carrierMatches[i]
+    if (!c) return false
+    root.carrierCode = c.code
+    root.carrierPickedName = c.name
+    carrierField.text = c.name
+    root.carrierMatches = []
+    return true
+  }
+
+  function submitAdd() {
+    if (root.addBusy) return
+    if (root.carrierCode === "" && root.carrierMatches.length > 0) root.pickCarrier(root.carrierIndex)
+    var built = Model.addArgs({
+      tracking: trackingField.text,
+      carrier: root.carrierCode,
+      description: descriptionField.text,
+      extra: root.carrierNeedsExtra ? extraField.text : ""
+    }, root.carrierExtras)
+    if (!built.ok) {
+      root.addMessage = built.message
+      return
+    }
+    root.addMessage = ""
+    root.addBusy = true
+    root._addDescription = descriptionField.text.trim()
+    addProc.command = [root.cliPath].concat(built.argv)
+    addProc.running = true
+  }
+  property string _addDescription: ""
+
+  Process {
+    id: addProc
+    running: false
+    command: []
+    stdout: StdioCollector { id: addStdout; waitForEnd: true; onStreamFinished: root._addOutput = text }
+    onExited: function(exitCode) {
+      var result = Model.parseAddResult(addStdout.text || root._addOutput)
+      root._addOutput = ""
+      root.addBusy = false
+      if (!result.ok) {
+        root.addMessage = result.message
+        return
+      }
+      Quickshell.execDetached(["omarchy-notification-send", "--app-name", "Parcel", "-g", Model.BAR_GLYPH,
+        "Delivery added", root._addDescription + " · tracking data appears after Parcel's next update"])
+      root.cancelAdd()
+      root.refreshAll()
+    }
+  }
+  property string _addOutput: ""
+
   // Carrier code → name map, via the bridge so `parcel-api carriers --refresh`
   // (state cache) takes precedence over the bundled data/carriers.json.
   Process {
@@ -261,6 +362,7 @@ Panel {
       var parsed = Model.parseCarriers(raw)
       if (Object.keys(parsed).length === 0) return
       root.carriers = parsed
+      root.carrierExtras = Model.parseCarrierExtras(raw)
       // Deliveries fetched before the carrier list arrived carry bare codes;
       // re-parse the last response so names appear.
       if (root.lastRaw) root.applyRaw(root.lastRaw)
@@ -312,12 +414,14 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: root.adding
       onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveCursor(dy) }
       onActivateRequested: root.activateCursor()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r") root.refreshAll()
+        else if (t === "a") root.startAdd()
         else if (t === "y" || t === "c") root.copyTracking()
         else if (t === "o") root.openWeb()
       }
@@ -335,7 +439,7 @@ Panel {
           Row {
             id: headerLeft
             anchors.left: parent.left
-            anchors.right: refreshButton.left
+            anchors.right: addButton.left
             anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(12)
@@ -375,6 +479,19 @@ Panel {
           }
 
           PanelActionButton {
+            id: addButton
+            anchors.right: refreshButton.left
+            anchors.rightMargin: Style.space(4)
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰐕"
+            tooltipText: "Add a delivery (a)"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            enabled: !root.needsSetup && !root.adding
+            onClicked: root.startAdd()
+          }
+
+          PanelActionButton {
             id: refreshButton
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
@@ -397,6 +514,178 @@ Panel {
         PanelSeparator {
           width: parent.width
           foreground: root.foreground
+        }
+
+        // ---- Add a delivery.
+        Column {
+          id: addForm
+          visible: root.adding
+          width: parent.width
+          spacing: Style.space(8)
+
+          // Esc cancels, Tab/Enter move on; the carrier field adds ↑↓ over
+          // its suggestions and Enter to pick one.
+          function fieldKeys(event, next) {
+            if (event.key === Qt.Key_Escape) {
+              root.cancelAdd(); event.accepted = true
+            } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              if (next) next.forceActiveFocus()
+              else if (event.key !== Qt.Key_Tab) root.submitAdd()
+              event.accepted = true
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "ADD A DELIVERY"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.letterSpacing: 1
+          }
+
+          TextField {
+            id: trackingField
+            width: parent.width
+            enabled: !root.addBusy
+            placeholderText: "Tracking number"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            Keys.onPressed: function(event) { addForm.fieldKeys(event, carrierField) }
+          }
+
+          TextField {
+            id: carrierField
+            width: parent.width
+            enabled: !root.addBusy
+            placeholderText: "Carrier — type to search (DHL, Amazon Spain, CTT…)"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            onTextChanged: if (root.adding) root.carrierTyped()
+            Keys.onPressed: function(event) {
+              var open = root.carrierCode === "" && root.carrierMatches.length > 0
+              if (open && event.key === Qt.Key_Down) {
+                root.carrierIndex = Math.min(root.carrierMatches.length - 1, root.carrierIndex + 1); event.accepted = true
+              } else if (open && event.key === Qt.Key_Up) {
+                root.carrierIndex = Math.max(0, root.carrierIndex - 1); event.accepted = true
+              } else if (open && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Tab)) {
+                root.pickCarrier(root.carrierIndex)
+                descriptionField.forceActiveFocus()
+                event.accepted = true
+              } else {
+                addForm.fieldKeys(event, descriptionField)
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            visible: root.carrierCode === "" && root.carrierMatches.length > 0
+            spacing: 0
+
+            Repeater {
+              model: root.carrierMatches
+
+              delegate: Rectangle {
+                required property var modelData
+                required property int index
+
+                width: parent.width
+                height: suggestionText.implicitHeight + Style.space(8)
+                radius: Style.cornerRadius
+                color: index === root.carrierIndex || suggestionMouse.containsMouse
+                  ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+
+                Text {
+                  id: suggestionText
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.leftMargin: Style.space(10)
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.name + (root.carrierExtras[modelData.code] ? "  · needs email or postcode" : "")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+
+                MouseArea {
+                  id: suggestionMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onClicked: {
+                    root.pickCarrier(index)
+                    descriptionField.forceActiveFocus()
+                  }
+                }
+              }
+            }
+          }
+
+          TextField {
+            id: descriptionField
+            width: parent.width
+            enabled: !root.addBusy
+            placeholderText: "Description — what it is, e.g. USB hub"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            Keys.onPressed: function(event) { addForm.fieldKeys(event, root.carrierNeedsExtra ? extraField : null) }
+          }
+
+          TextField {
+            id: extraField
+            visible: root.carrierNeedsExtra
+            width: parent.width
+            enabled: !root.addBusy
+            placeholderText: "Order email or destination postcode"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            Keys.onPressed: function(event) { addForm.fieldKeys(event, null) }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.addMessage !== ""
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: root.addMessage
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Row {
+            spacing: Style.space(8)
+
+            Button {
+              text: root.addBusy ? "Adding…" : "Add"
+              iconText: "󰐕"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              enabled: !root.addBusy
+              onClicked: root.submitAdd()
+            }
+            Button {
+              text: "Cancel"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              enabled: !root.addBusy
+              onClicked: root.cancelAdd()
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Parcel allows 20 adds a day, and failed ones count. ⏎ next field · Esc cancel"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
         }
 
         // ---- Setup: no API key in the keyring yet.
@@ -483,7 +772,7 @@ Panel {
         // ---- Empty.
         Text {
           textFormat: Text.PlainText
-          visible: !root.needsSetup && !root.showingError && root.everLoaded && root.deliveries.length === 0
+          visible: !root.adding && !root.needsSetup && !root.showingError && root.everLoaded && root.deliveries.length === 0
           text: root.filterMode === "recent" ? "Nothing tracked recently." : "Nothing on the way right now."
           color: root.dim
           font.family: root.fontFamily
@@ -494,7 +783,7 @@ Panel {
         // ---- Deliveries.
         Flickable {
           id: listFlick
-          visible: root.deliveries.length > 0
+          visible: !root.adding && root.deliveries.length > 0
           width: parent.width
           height: Math.min(rowsColumn.implicitHeight, Style.space(460))
           contentWidth: width
@@ -705,8 +994,9 @@ Panel {
           }
           Text {
             textFormat: Text.PlainText
+            visible: !root.adding
             width: parent.width
-            text: "↑↓ select · ⏎ details · y copy · r refresh · o open Parcel"
+            text: "↑↓ select · ⏎ details · a add · y copy · r refresh · o open Parcel"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
